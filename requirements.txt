@@ -1,0 +1,3 @@
+mnemonic>=0.21
+bip32utils>=0.3
+bech32>=1.2
