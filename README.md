@@ -191,7 +191,7 @@ base58>=2.1
 
 ## License
 
-MIT License — © 2026 your-username
+MIT License — © 2026 leonardoramcke
 
 You are free to use, copy, modify and distribute this software **with attribution to the original author**.  
 See the [LICENSE](LICENSE) file for full details.
