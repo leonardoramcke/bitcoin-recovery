@@ -269,14 +269,15 @@ def worker_search(task_queue, result_queue, passphrase, target,
 
 def mode_one_missing(words_23, passphrase, target, path, addr_limit, change_limit,
                      known_position, log_fn, progress_fn, stop_event, num_workers=1):
-    positions = [known_position - 1] if known_position > 0 else list(range(24))
+    seed_size = len(words_23) + 1  # total seed size = known words + 1 missing
+    positions = [known_position - 1] if known_position > 0 else list(range(seed_size))
     total = len(positions) * 2048
     done = 0
 
     for pos in positions:
         if stop_event.is_set():
             return None
-        log_fn(f"⟳ Testing position {pos + 1}/24 with {num_workers} worker(s)...")
+        log_fn(f"⟳ Testing position {pos + 1}/{seed_size} with {num_workers} worker(s)...")
 
         if num_workers <= 1:
             # Single-threaded
@@ -955,6 +956,7 @@ class BitcoinRecoveryApp:
                 f"Words not found in BIP39 wordlist:\n{', '.join(invalid)}\n\nCheck spelling.")
             return None
 
+        seed_size = len(words) + words.count('?') if '?' not in words else len(words)
         return {
             'words':        words,
             'passphrase':   passphrase,
@@ -966,6 +968,7 @@ class BitcoinRecoveryApp:
             'pos1':         self.pos1_var.get(),
             'pos2':         self.pos2_var.get(),
             'num_workers':  self.workers_var.get(),
+            'seed_size':    len(words) + 1,
         }
 
     def _start_recovery(self):
@@ -1008,22 +1011,34 @@ class BitcoinRecoveryApp:
         result = None
 
         try:
-            if mode == "1_missing_unknown":
-                if len(words) != 23:
-                    self._log(f"❌ Expected 23 words, got {len(words)}")
+            total_expected = p.get('seed_size', 24)
+            missing = total_expected - len(words)
+
+            # Warn user if many words are missing
+            if missing > 3:
+                combinacoes = 2048 ** missing
+                from math import log10
+                exp = int(log10(combinacoes))
+                ans = messagebox.askyesno("⚠️ Warning — Long Search",
+                    f"You have {len(words)} of {total_expected} words.\n"
+                    f"Missing: {missing} words\n"
+                    f"Combinations: ~10^{exp}\n\n"
+                    f"Estimated time: {formatar_tempo(combinacoes / (SPEED_PER_SECOND * max(1,workers)))}\n\n"
+                    f"The search may take an extremely long time.\n"
+                    f"Do you want to start anyway?")
+                if not ans:
                     return
+
+            if mode == "1_missing_unknown":
                 result = mode_one_missing(words, passphrase, target, path,
                                           addr_limit, change_limit, -1,
                                           self._log, self._set_progress,
                                           self.stop_event, workers)
 
             elif mode == "1_missing_known":
-                if len(words) != 23:
-                    self._log(f"❌ Expected 23 words, got {len(words)}")
-                    return
                 pos = p['pos1']
-                if pos < 1 or pos > 24:
-                    self._log("❌ Position must be between 1 and 24")
+                if pos < 1 or pos > total_expected:
+                    self._log(f"❌ Position must be between 1 and {total_expected}")
                     return
                 result = mode_one_missing(words, passphrase, target, path,
                                           addr_limit, change_limit, pos,
@@ -1031,12 +1046,9 @@ class BitcoinRecoveryApp:
                                           self.stop_event, workers)
 
             elif mode == "2_missing_known":
-                if len(words) != 22:
-                    self._log(f"❌ Expected 22 words, got {len(words)}")
-                    return
                 pos1, pos2 = p['pos1'], p['pos2']
                 if pos1 < 1 or pos2 < 1 or pos1 >= pos2:
-                    self._log("❌ Provide valid positions (pos1 < pos2, both 1–24)")
+                    self._log("❌ Provide valid positions (pos1 < pos2)")
                     return
                 result = mode_two_missing(words, [pos1, pos2], passphrase, target, path,
                                           addr_limit, change_limit,
