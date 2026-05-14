@@ -61,7 +61,7 @@ Everything runs **locally on your machine** — no data is ever sent to the inte
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/bitcoin-recovery.git
+git clone https://github.com/leonardoramcke/bitcoin-recovery.git
 cd bitcoin-recovery
 ```
 
