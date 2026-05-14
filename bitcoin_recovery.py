@@ -5,871 +5,678 @@
 ║         by: leonardoramcke (github.com/leonardoramcke)      ║
 ║         MIT License © 2026                                  ║
 ╚══════════════════════════════════════════════════════════════╝
-
-Recovery tool for Bitcoin BIP39 wallets.
-Supports CPU multicore processing with full hardware control.
-Derivations: BIP44, BIP49, BIP84
 """
 
-import hashlib
-import time
-import sys
-import os
-import itertools
-import threading
-import math
-import multiprocessing
-import psutil
-import tkinter as tk
+import hashlib, time, sys, os, itertools, threading, math, multiprocessing
+import psutil, tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 import bech32
 from mnemonic import Mnemonic
 from bip32utils import BIP32Key, BIP32_HARDEN
 
-# ──────────────────────────────────────────────
-#  GLOBALS
-# ──────────────────────────────────────────────
-
-MNEMO    = Mnemonic('english')
-WORDLIST = MNEMO.wordlist
+MNEMO     = Mnemonic('english')
+WORDLIST  = MNEMO.wordlist
 CPU_COUNT = multiprocessing.cpu_count()
-
-# ──────────────────────────────────────────────
-#  BASE58CHECK — pure Python (no external lib)
-# ──────────────────────────────────────────────
-
-_B58_ALPHABET = b'123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
-
-def _b58encode(payload: bytes) -> str:
-    """Base58Check encoding — pure Python, no library needed."""
-    n = int.from_bytes(payload, 'big')
-    result = []
-    while n > 0:
-        n, remainder = divmod(n, 58)
-        result.append(_B58_ALPHABET[remainder])
-    leading_zeros = len(payload) - len(payload.lstrip(b'\x00'))
-    result.extend([_B58_ALPHABET[0]] * leading_zeros)
-    return bytes(reversed(result)).decode('ascii')
-
-
-# ──────────────────────────────────────────────
-#  HARDWARE MONITOR
-# ──────────────────────────────────────────────
-
-def get_cpu_usage():
-    return psutil.cpu_percent(interval=0.1)
-
-def get_ram_usage():
-    return psutil.virtual_memory().percent
-
-def get_cpu_temp():
-    try:
-        temps = psutil.sensors_temperatures()
-        if temps:
-            for name, entries in temps.items():
-                if entries:
-                    return entries[0].current
-    except Exception:
-        pass
-    return None
-
-def get_ram_available_gb():
-    return psutil.virtual_memory().available / (1024**3)
-
-# ──────────────────────────────────────────────
-#  ESTIMATIVA DE TEMPO
-# ──────────────────────────────────────────────
-
 SPEED_PER_SECOND = 150
 
-def calcular_combinacoes(total_palavras, palavras_conhecidas, posicao_conhecida=False):
-    faltando = total_palavras - palavras_conhecidas
-    if faltando <= 0:
-        return 1
-    if faltando == 1 and posicao_conhecida:
-        return 2048
-    if faltando == 1:
-        return total_palavras * 2048
-    return 2048 ** faltando
+# ── Base58Check (pure Python) ──────────────────
+_B58 = b'123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+def _b58encode(payload):
+    n = int.from_bytes(payload, 'big')
+    res = []
+    while n > 0:
+        n, r = divmod(n, 58)
+        res.append(_B58[r])
+    res.extend([_B58[0]] * (len(payload) - len(payload.lstrip(b'\x00'))))
+    return bytes(reversed(res)).decode('ascii')
 
-def formatar_tempo(segundos):
-    if segundos < 60:
-        return f"~{int(segundos)} seconds"
-    elif segundos < 3600:
-        return f"~{int(segundos/60)} minutes"
-    elif segundos < 86400:
-        return f"~{int(segundos/3600)} hours"
-    elif segundos < 86400 * 30:
-        return f"~{int(segundos/86400)} days"
-    elif segundos < 86400 * 365:
-        return f"~{int(segundos/86400/30)} months"
-    elif segundos < 86400 * 365 * 1000:
-        return f"~{int(segundos/86400/365)} years"
-    else:
-        return "eternity (not feasible)"
+# ── Levenshtein distance (neighborhood search) ─
+def levenshtein(a, b):
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev = dp[0]; dp[0] = i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            dp[j] = prev if a[i-1] == b[j-1] else 1 + min(dp[j], dp[j-1], prev)
+            prev = temp
+    return dp[n]
 
-def avaliar_viabilidade(combinacoes, workers=1):
-    speed = SPEED_PER_SECOND * workers
-    segundos = combinacoes / speed
-    if segundos < 1800:
-        return "EASY", "#3fb950", segundos
-    elif segundos < 86400:
-        return "MODERATE", "#f7b731", segundos
-    elif segundos < 86400*30:
-        return "HARD", "#e3702a", segundos
-    elif segundos < 86400*365:
-        return "VERY HARD", "#da3633", segundos
-    else:
-        return "NOT FEASIBLE", "#8b0000", segundos
+def similar_words(word, max_dist=2):
+    """Return BIP39 words similar to 'word', sorted by distance."""
+    scored = [(levenshtein(word.lower(), w), w) for w in WORDLIST]
+    scored.sort()
+    return [w for d, w in scored if d <= max_dist]
 
-def gerar_analise(palavras_conhecidas, total_palavras, tem_senha,
-                  tem_endereco, tem_derivacao, posicao_conhecida, workers=1):
-    faltando = total_palavras - palavras_conhecidas
-    combinacoes = calcular_combinacoes(total_palavras, palavras_conhecidas, posicao_conhecida)
-    nivel, cor, segundos = avaliar_viabilidade(combinacoes, workers)
-    tempo = formatar_tempo(segundos)
+def words_matching_pattern(starts_with='', length=0):
+    """Filter wordlist by prefix and/or length."""
+    result = WORDLIST
+    if starts_with:
+        result = [w for w in result if w.startswith(starts_with.lower())]
+    if length > 0:
+        result = [w for w in result if len(w) == length]
+    return result
 
-    linhas = []
-    linhas.append("━━━  SITUATION ANALYSIS  ━━━")
-    linhas.append("")
-    linhas.append(f"  Seed size         : {total_palavras} words")
-    linhas.append(f"  You have          : {palavras_conhecidas} words")
-    linhas.append(f"  Missing           : {faltando} word(s)")
-    linhas.append(f"  Position known    : {'Yes ✅' if posicao_conhecida else 'No ❌'}")
-    linhas.append(f"  Has passphrase    : {'Yes ✅' if tem_senha else 'No ❌'}")
-    linhas.append(f"  Has address       : {'Yes ✅' if tem_endereco else 'No ❌  ← important!'}")
-    linhas.append(f"  Has derivation    : {'Yes ✅' if tem_derivacao else 'No ❌'}")
-    linhas.append(f"  Workers (cores)   : {workers}")
-    linhas.append("")
-    linhas.append(f"  Combinations      : {combinacoes:,}")
-    linhas.append(f"  Estimated time    : {tempo}")
-    linhas.append(f"  Feasibility       : {nivel}")
-    linhas.append("")
+# ── BIP39 checksum filter ──────────────────────
+def passes_checksum(words):
+    """Quick BIP39 checksum validation."""
+    return MNEMO.check(' '.join(words))
 
-    if faltando == 0:
-        linhas.append("  ℹ️  You have all words!")
-        linhas.append("  Check passphrase and derivation type.")
-    elif faltando == 1 and posicao_conhecida:
-        linhas.append("  🟢 Ideal situation. Seconds to solve.")
-    elif faltando == 1:
-        linhas.append("  🟢 Great. One missing word is totally feasible.")
-        linhas.append("  Knowing the position makes it even faster.")
-    elif faltando == 2:
-        linhas.append("  🟡 Possible. May take hours.")
-        linhas.append("  If you know the positions, provide them.")
-    elif faltando == 3:
-        linhas.append("  🟠 Hard. May take days or weeks.")
-    elif faltando <= 5:
-        linhas.append("  🔴 Very hard on a regular PC.")
-        linhas.append("  Specialized hardware (GPUs) would be needed.")
-    else:
-        linhas.append("  💀 Not feasible with common hardware.")
+def valid_last_words(words_23):
+    """For a 24-word seed, only ~8 of 2048 last words pass checksum."""
+    return [w for w in WORDLIST if passes_checksum(words_23 + [w])]
 
-    linhas.append("")
-    linhas.append("  💡 What can still help:")
-    if not tem_endereco:
-        linhas.append("   ➕ Public address → essential to confirm a match")
-    if not posicao_conhecida and faltando >= 1:
-        linhas.append("   ➕ Word position → drastically reduces combinations")
-    if not tem_derivacao:
-        linhas.append("   ➕ BIP type (84/44/49) → avoids testing wrong paths")
-    if not tem_senha:
-        linhas.append("   ➕ Confirm no passphrase was used → eliminates a variable")
-    if faltando > 2:
-        linhas.append("   ➕ Each extra word you remember divides time by 2048")
-    if workers < CPU_COUNT:
-        linhas.append(f"   ➕ More CPU workers → you have {CPU_COUNT} cores available")
+# ── Time estimation ────────────────────────────
+def fmt_time(s):
+    if s < 60:      return f"~{int(s)} seconds"
+    if s < 3600:    return f"~{int(s/60)} minutes"
+    if s < 86400:   return f"~{int(s/3600)} hours"
+    if s < 2592000: return f"~{int(s/86400)} days"
+    if s < 31536000:return f"~{int(s/2592000)} months"
+    if s < 31536000000: return f"~{int(s/31536000)} years"
+    return "eternity (not feasible)"
 
-    return "\n".join(linhas), cor, nivel
+def feasibility(combos, workers=1):
+    s = combos / max(1, SPEED_PER_SECOND * workers)
+    if s < 1800:    return "EASY",          "#3fb950", s
+    if s < 86400:   return "MODERATE",      "#f7b731", s
+    if s < 2592000: return "HARD",          "#e3702a", s
+    if s < 31536000:return "VERY HARD",     "#da3633", s
+    return              "NOT FEASIBLE",  "#8b0000", s
 
-# ──────────────────────────────────────────────
-#  CORE: Address derivation
-# ──────────────────────────────────────────────
-
+# ── Address derivation ─────────────────────────
 def derive_address(seed_bytes, path_type="bip84", index=0, change=0):
     try:
         master = BIP32Key.fromEntropy(seed_bytes)
         if path_type == "bip84":
-            child = (master
-                     .ChildKey(84 + BIP32_HARDEN)
-                     .ChildKey(0 + BIP32_HARDEN)
-                     .ChildKey(0 + BIP32_HARDEN)
-                     .ChildKey(change)
-                     .ChildKey(index))
-            pubkey = child.PublicKey()
-            sha256 = hashlib.sha256(pubkey).digest()
-            ripemd = hashlib.new('ripemd160', sha256).digest()
-            return bech32.encode('bc', 0, ripemd)
+            child = (master.ChildKey(84+BIP32_HARDEN).ChildKey(0+BIP32_HARDEN)
+                     .ChildKey(0+BIP32_HARDEN).ChildKey(change).ChildKey(index))
+            pub = child.PublicKey()
+            h = hashlib.new('ripemd160', hashlib.sha256(pub).digest()).digest()
+            return bech32.encode('bc', 0, h)
         elif path_type == "bip44":
-            child = (master
-                     .ChildKey(44 + BIP32_HARDEN)
-                     .ChildKey(0 + BIP32_HARDEN)
-                     .ChildKey(0 + BIP32_HARDEN)
-                     .ChildKey(change)
-                     .ChildKey(index))
+            child = (master.ChildKey(44+BIP32_HARDEN).ChildKey(0+BIP32_HARDEN)
+                     .ChildKey(0+BIP32_HARDEN).ChildKey(change).ChildKey(index))
             return child.Address()
         elif path_type == "bip49":
-            child = (master
-                     .ChildKey(49 + BIP32_HARDEN)
-                     .ChildKey(0 + BIP32_HARDEN)
-                     .ChildKey(0 + BIP32_HARDEN)
-                     .ChildKey(change)
-                     .ChildKey(index))
-            pubkey = child.PublicKey()
-            sha256 = hashlib.sha256(pubkey).digest()
-            ripemd = hashlib.new('ripemd160', sha256).digest()
-            redeem = bytes([0x00, 0x14]) + ripemd
-            sha256b = hashlib.sha256(redeem).digest()
-            ripemd2 = hashlib.new('ripemd160', sha256b).digest()
-            prefix = bytes([0x05])
-            checksum = hashlib.sha256(hashlib.sha256(prefix + ripemd2).digest()).digest()[:4]
-            return _b58encode(prefix + ripemd2 + checksum)
+            child = (master.ChildKey(49+BIP32_HARDEN).ChildKey(0+BIP32_HARDEN)
+                     .ChildKey(0+BIP32_HARDEN).ChildKey(change).ChildKey(index))
+            pub = child.PublicKey()
+            h = hashlib.new('ripemd160', hashlib.sha256(pub).digest()).digest()
+            redeem = bytes([0x00, 0x14]) + h
+            h2 = hashlib.new('ripemd160', hashlib.sha256(redeem).digest()).digest()
+            pre = bytes([0x05])
+            chk = hashlib.sha256(hashlib.sha256(pre+h2).digest()).digest()[:4]
+            return _b58encode(pre + h2 + chk)
     except Exception:
         return None
 
-def check_mnemonic(words, passphrase, target_address, path_type, addr_limit, change_limit):
+def check_seed(words, passphrase, target, path, addr_limit, change_limit):
     phrase = ' '.join(words)
     if not MNEMO.check(phrase):
         return False
     seed = MNEMO.to_seed(phrase, passphrase)
     for c in range(change_limit):
         for i in range(addr_limit):
-            addr = derive_address(seed, path_type, i, c)
-            if addr and addr == target_address:
+            if derive_address(seed, path, i, c) == target:
                 return True
     return False
 
-# ──────────────────────────────────────────────
-#  WORKER FUNCTION (runs in separate process)
-# ──────────────────────────────────────────────
+# ── Smart candidate builder ────────────────────
+def build_candidates(known_words, missing_positions, hint_starts='',
+                     hint_length=0, hint_typo='', seed_size=24):
+    """
+    Build a smart ordered wordlist for missing positions.
+    Priority: checksum filter > pattern filter > typo neighbors > full list
+    """
+    # Base candidate list
+    if hint_typo.strip():
+        base = similar_words(hint_typo.strip(), max_dist=2)
+        if not base:
+            base = list(WORDLIST)
+    else:
+        base = list(WORDLIST)
 
-def worker_search(task_queue, result_queue, passphrase, target,
-                  path_type, addr_limit, change_limit):
-    """Worker process: pulls word chunks from queue and searches."""
-    while True:
-        try:
-            task = task_queue.get(timeout=2)
-            if task is None:
-                break
-            pos, words_base, word_chunk = task
-            for word in word_chunk:
-                candidate = words_base[:pos] + [word] + words_base[pos:]
-                if check_mnemonic(candidate, passphrase, target, path_type,
-                                  addr_limit, change_limit):
-                    result_queue.put({'words': candidate, 'found_word': word,
-                                      'position': pos + 1})
-                    return
-            result_queue.put(('progress', len(word_chunk)))
-        except Exception:
-            break
+    # Apply pattern filters
+    if hint_starts.strip():
+        base = [w for w in base if w.startswith(hint_starts.strip().lower())]
+    if hint_length > 0:
+        base = [w for w in base if len(w) == hint_length]
 
-# ──────────────────────────────────────────────
-#  RECOVERY MODES
-# ──────────────────────────────────────────────
+    if not base:
+        base = list(WORDLIST)
 
-def mode_one_missing(words_23, passphrase, target, path, addr_limit, change_limit,
-                     known_position, log_fn, progress_fn, stop_event, num_workers=1):
-    seed_size = len(words_23) + 1  # total seed size = known words + 1 missing
-    positions = [known_position - 1] if known_position > 0 else list(range(seed_size))
-    total = len(positions) * 2048
-    done = 0
+    return base
 
-    for pos in positions:
+# ── Recovery engine ────────────────────────────
+def recover(known_words, missing_positions, passphrase, target, path,
+            addr_limit, change_limit, hint_starts, hint_length, hint_typo,
+            seed_size, log_fn, progress_fn, stop_event, num_workers=1):
+    """
+    Main recovery function.
+    known_words: list of words the user has (in order, without gaps)
+    missing_positions: list of 0-based indexes where words are missing
+    """
+    # Build full skeleton with None at missing positions
+    full = list(known_words)
+    for pos in sorted(missing_positions):
+        full.insert(pos, None)
+
+    candidates = build_candidates(known_words, missing_positions,
+                                  hint_starts, hint_length, hint_typo, seed_size)
+
+    n_missing = len(missing_positions)
+    total = len(candidates) ** n_missing
+    done  = 0
+
+    log_fn(f"  Missing positions : {[p+1 for p in missing_positions]}")
+    log_fn(f"  Candidate words   : {len(candidates)} per position")
+    log_fn(f"  Total combinations: {total:,}")
+    log_fn(f"  Estimated time    : {fmt_time(total / max(1, SPEED_PER_SECOND * num_workers))}")
+    log_fn("─" * 50)
+
+    # Checksum shortcut: if only last position is missing, filter heavily
+    if missing_positions == [seed_size - 1] and not hint_starts and not hint_typo:
+        candidates = valid_last_words(full[:seed_size-1])
+        log_fn(f"  ✨ Checksum filter applied → only {len(candidates)} valid last words")
+        total = len(candidates)
+
+    for combo in itertools.product(candidates, repeat=n_missing):
         if stop_event.is_set():
             return None
-        log_fn(f"⟳ Testing position {pos + 1}/{seed_size} with {num_workers} worker(s)...")
-
-        if num_workers <= 1:
-            # Single-threaded
-            for word in WORDLIST:
-                if stop_event.is_set():
-                    return None
-                candidate = words_23[:pos] + [word] + words_23[pos:]
-                done += 1
-                progress_fn(done, total)
-                if check_mnemonic(candidate, passphrase, target, path,
-                                  addr_limit, change_limit):
-                    return {'words': candidate, 'found_word': word, 'position': pos + 1}
-        else:
-            # Multi-process
-            chunk_size = max(1, len(WORDLIST) // num_workers)
-            chunks = [WORDLIST[i:i+chunk_size]
-                      for i in range(0, len(WORDLIST), chunk_size)]
-
-            task_q   = multiprocessing.Queue()
-            result_q = multiprocessing.Queue()
-
-            for chunk in chunks:
-                task_q.put((pos, words_23, chunk))
-            for _ in range(num_workers):
-                task_q.put(None)
-
-            procs = []
-            for _ in range(num_workers):
-                p = multiprocessing.Process(
-                    target=worker_search,
-                    args=(task_q, result_q, passphrase, target,
-                          path, addr_limit, change_limit),
-                    daemon=True)
-                p.start()
-                procs.append(p)
-
-            result = None
-            finished = 0
-            while finished < len(chunks):
-                if stop_event.is_set():
-                    for p in procs:
-                        p.terminate()
-                    return None
-                try:
-                    msg = result_q.get(timeout=0.5)
-                    if isinstance(msg, dict):
-                        result = msg
-                        for p in procs:
-                            p.terminate()
-                        break
-                    elif isinstance(msg, tuple) and msg[0] == 'progress':
-                        done += msg[1]
-                        progress_fn(done, total)
-                        finished += 1
-                except Exception:
-                    pass
-
-            for p in procs:
-                p.join(timeout=1)
-
-            if result:
-                return result
-
-    return None
-
-
-def mode_two_missing(words_22, missing_positions, passphrase, target, path,
-                     addr_limit, change_limit, log_fn, progress_fn, stop_event,
-                     num_workers=1):
-    total = 2048 * 2048
-    done = 0
-    p1, p2 = missing_positions[0] - 1, missing_positions[1] - 1
-
-    for w1 in WORDLIST:
-        if stop_event.is_set():
-            return None
-        log_fn(f"⟳ First word: '{w1}'...")
-        for w2 in WORDLIST:
-            if stop_event.is_set():
-                return None
-            candidate = list(words_22)
-            candidate.insert(p1, w1)
-            candidate.insert(p2 + 1, w2)
-            done += 1
-            progress_fn(done, total)
-            if check_mnemonic(candidate, passphrase, target, path,
-                              addr_limit, change_limit):
-                return {'words': candidate, 'found_words': [w1, w2],
-                        'positions': [p1+1, p2+1]}
-    return None
-
-
-def mode_partial_known(partial_words, known_mask, passphrase, target, path,
-                       addr_limit, change_limit, log_fn, progress_fn, stop_event,
-                       num_workers=1):
-    unknown_positions = [i for i, known in enumerate(known_mask) if not known]
-    n_unknown = len(unknown_positions)
-    total = 2048 ** n_unknown
-    done = 0
-
-    log_fn(f"⟳ {n_unknown} unknown words → {total:,} combinations")
-    if total > 10_000_000:
-        log_fn(f"⚠️  Many combinations ({total:,}). May take a long time.")
-
-    for combo in itertools.product(WORDLIST, repeat=n_unknown):
-        if stop_event.is_set():
-            return None
-        candidate = list(partial_words)
-        for i, pos in enumerate(unknown_positions):
+        candidate = list(full)
+        for i, pos in enumerate(missing_positions):
             candidate[pos] = combo[i]
         done += 1
-        if done % 10000 == 0:
+        if done % 500 == 0:
             progress_fn(done, total)
-            log_fn(f"⟳ {done:,}/{total:,} tested...")
-        if check_mnemonic(candidate, passphrase, target, path,
-                          addr_limit, change_limit):
-            return {'words': candidate, 'found_words': list(combo),
-                    'positions': unknown_positions}
+        if check_seed(candidate, passphrase, target, path, addr_limit, change_limit):
+            return {'words': candidate, 'found': list(combo),
+                    'positions': [p+1 for p in missing_positions]}
+
+    progress_fn(total, total)
     return None
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 #  GUI
-# ──────────────────────────────────────────────
-
-class BitcoinRecoveryApp:
+# ══════════════════════════════════════════════
+class App:
     def __init__(self, root):
         self.root = root
         self.root.title("BIP39 Bitcoin Wallet Recovery Tool")
-        self.root.geometry("960x860")
-        self.root.resizable(True, True)
-        self.root.minsize(900, 800)
+        self.root.geometry("980x880")
+        self.root.minsize(900, 820)
         self.root.configure(bg="#0d1117")
-
-        self.stop_event      = threading.Event()
-        self.recovery_thread = None
-
+        self.stop_event = threading.Event()
         self._setup_styles()
         self._build_ui()
-        self._start_hardware_monitor()
+        self._start_hw_monitor()
 
+    # ── Styles ──────────────────────────────────
     def _setup_styles(self):
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure('TNotebook', background='#0d1117', borderwidth=0)
-        style.configure('TNotebook.Tab', background='#161b22', foreground='#8b949e',
-                        padding=[16, 8], font=('Consolas', 10))
-        style.map('TNotebook.Tab',
-                  background=[('selected', '#1f2937')],
-                  foreground=[('selected', '#f7b731')])
-        style.configure('TFrame', background='#0d1117')
-        style.configure('TLabel', background='#0d1117', foreground='#c9d1d9',
-                        font=('Consolas', 10))
-        style.configure('TLabelframe', background='#0d1117', foreground='#f7b731',
-                        bordercolor='#30363d')
-        style.configure('TLabelframe.Label', background='#0d1117',
-                        foreground='#f7b731', font=('Consolas', 10, 'bold'))
-        style.configure('TCombobox', fieldbackground='#161b22', background='#161b22',
-                        foreground='#c9d1d9', font=('Consolas', 10))
-        style.configure('Horizontal.TProgressbar', background='#f7b731',
-                        troughcolor='#161b22', borderwidth=0)
-        style.configure('CPU.Horizontal.TProgressbar', background='#3fb950',
-                        troughcolor='#161b22', borderwidth=0)
-        style.configure('RAM.Horizontal.TProgressbar', background='#58a6ff',
-                        troughcolor='#161b22', borderwidth=0)
-        style.configure('TEMP.Horizontal.TProgressbar', background='#f7b731',
-                        troughcolor='#161b22', borderwidth=0)
+        s = ttk.Style(); s.theme_use('clam')
+        s.configure('TNotebook', background='#0d1117', borderwidth=0)
+        s.configure('TNotebook.Tab', background='#161b22', foreground='#8b949e',
+                    padding=[16,8], font=('Consolas',10))
+        s.map('TNotebook.Tab', background=[('selected','#1f2937')],
+              foreground=[('selected','#f7b731')])
+        s.configure('TFrame', background='#0d1117')
+        s.configure('TLabel', background='#0d1117', foreground='#c9d1d9',
+                    font=('Consolas',10))
+        s.configure('TLabelframe', background='#0d1117', foreground='#f7b731',
+                    bordercolor='#30363d')
+        s.configure('TLabelframe.Label', background='#0d1117',
+                    foreground='#f7b731', font=('Consolas',10,'bold'))
+        s.configure('TCombobox', fieldbackground='#161b22', background='#161b22',
+                    foreground='#c9d1d9', font=('Consolas',10))
+        s.configure('Horizontal.TProgressbar', background='#f7b731',
+                    troughcolor='#161b22', borderwidth=0)
 
-    def _entry(self, parent, show=None, width=40):
-        return tk.Entry(parent, show=show, width=width,
-                        bg='#161b22', fg='#c9d1d9',
+    def _entry(self, p, show=None, w=40):
+        return tk.Entry(p, show=show, width=w, bg='#161b22', fg='#c9d1d9',
                         insertbackground='#f7b731', relief='flat', bd=6,
-                        font=('Consolas', 10), highlightthickness=1,
+                        font=('Consolas',10), highlightthickness=1,
                         highlightcolor='#f7b731', highlightbackground='#30363d')
 
-    def _btn(self, parent, text, command, color='#f7b731', fg='#0d1117'):
-        return tk.Button(parent, text=text, command=command,
-                         bg=color, fg=fg, activebackground='#e5a820',
-                         relief='flat', bd=0, padx=20, pady=8,
-                         font=('Consolas', 10, 'bold'), cursor='hand2')
+    def _btn(self, p, text, cmd, color='#f7b731', fg='#0d1117'):
+        return tk.Button(p, text=text, command=cmd, bg=color, fg=fg,
+                         activebackground='#e5a820', relief='flat', bd=0,
+                         padx=20, pady=8, font=('Consolas',10,'bold'), cursor='hand2')
 
+    def _label(self, p, text, fg='#8b949e', size=9):
+        return tk.Label(p, text=text, bg='#0d1117', fg=fg,
+                        font=('Consolas', size))
+
+    # ── Main UI ─────────────────────────────────
     def _build_ui(self):
-        # Header
-        header = tk.Frame(self.root, bg='#0d1117')
-        header.pack(fill='x', padx=20, pady=(16, 0))
-        tk.Label(header, text="₿ BIP39 Wallet Recovery",
-                 bg='#0d1117', fg='#f7b731',
-                 font=('Consolas', 18, 'bold')).pack(side='left')
-        tk.Label(header,
-                 text="BIP44 · BIP49 · BIP84  |  Multi-core CPU  |  Hardware Monitor",
-                 bg='#0d1117', fg='#484f58',
-                 font=('Consolas', 9)).pack(side='left', padx=16, pady=4)
-        ttk.Separator(self.root, orient='horizontal').pack(fill='x', padx=20, pady=8)
+        hdr = tk.Frame(self.root, bg='#0d1117')
+        hdr.pack(fill='x', padx=20, pady=(14,0))
+        tk.Label(hdr, text="₿ BIP39 Wallet Recovery", bg='#0d1117', fg='#f7b731',
+                 font=('Consolas',18,'bold')).pack(side='left')
+        tk.Label(hdr, text="BIP44 · BIP49 · BIP84  |  Smart Search  |  Multi-core  |  100% Offline",
+                 bg='#0d1117', fg='#484f58', font=('Consolas',9)).pack(side='left', padx=14)
+        ttk.Separator(self.root, orient='horizontal').pack(fill='x', padx=20, pady=6)
 
-        # Hardware monitor bar
         self._build_hw_bar()
 
-        # Notebook
         self.nb = ttk.Notebook(self.root)
-        self.nb.pack(fill='both', expand=False, padx=20, pady=0)
+        self.nb.pack(fill='both', expand=False, padx=20)
         self._tab_recovery()
         self._tab_hardware()
-        self._tab_analise()
+        self._tab_analysis()
         self._tab_about()
 
         # Log
-        bottom = tk.Frame(self.root, bg='#0d1117')
-        bottom.pack(fill='x', padx=20, pady=(8, 4))
-        log_frame = ttk.LabelFrame(bottom, text="  LOG  ")
-        log_frame.pack(fill='both', expand=True)
+        bf = tk.Frame(self.root, bg='#0d1117')
+        bf.pack(fill='x', padx=20, pady=(6,2))
+        lf = ttk.LabelFrame(bf, text="  LOG  ")
+        lf.pack(fill='x')
         self.log_box = scrolledtext.ScrolledText(
-            log_frame, height=5, bg='#010409', fg='#3fb950',
-            font=('Consolas', 9), relief='flat', bd=4,
+            lf, height=5, bg='#010409', fg='#3fb950',
+            font=('Consolas',9), relief='flat', bd=4,
             insertbackground='#3fb950', state='disabled')
-        self.log_box.pack(fill='both', expand=True, padx=4, pady=4)
+        self.log_box.pack(fill='x', padx=4, pady=4)
 
-        prog_frame = tk.Frame(bottom, bg='#0d1117')
-        prog_frame.pack(fill='x', pady=(4, 0))
-        self.progress_var = tk.DoubleVar()
-        ttk.Progressbar(prog_frame, variable=self.progress_var, maximum=100,
-                        style='Horizontal.TProgressbar').pack(
-            side='left', fill='x', expand=True)
-        self.progress_label = tk.Label(prog_frame, text="0%",
-                                       bg='#0d1117', fg='#8b949e',
-                                       font=('Consolas', 9), width=8)
-        self.progress_label.pack(side='left', padx=6)
+        # Progress
+        pf = tk.Frame(self.root, bg='#0d1117')
+        pf.pack(fill='x', padx=20, pady=(2,0))
+        self.prog_var = tk.DoubleVar()
+        ttk.Progressbar(pf, variable=self.prog_var, maximum=100,
+                        style='Horizontal.TProgressbar').pack(side='left', fill='x', expand=True)
+        self.prog_lbl = tk.Label(pf, text="0%", bg='#0d1117', fg='#8b949e',
+                                  font=('Consolas',9), width=7)
+        self.prog_lbl.pack(side='left', padx=4)
 
         # Buttons
-        btn_frame = tk.Frame(self.root, bg='#0d1117')
-        btn_frame.pack(pady=(4, 8))
-        self._btn(btn_frame, "▶  START RECOVERY", self._start_recovery).pack(side='left', padx=8)
-        self._btn(btn_frame, "■  STOP", self._stop_recovery,
-                  color='#da3633', fg='white').pack(side='left', padx=8)
-        self._btn(btn_frame, "⎘  EXPORT LOG", self._export_log,
-                  color='#238636', fg='white').pack(side='left', padx=8)
+        btnf = tk.Frame(self.root, bg='#0d1117')
+        btnf.pack(pady=(4,10))
+        self._btn(btnf, "▶  START RECOVERY", self._start).pack(side='left', padx=8)
+        self._btn(btnf, "■  STOP", self._stop, '#da3633', 'white').pack(side='left', padx=8)
+        self._btn(btnf, "⎘  EXPORT LOG", self._export, '#238636', 'white').pack(side='left', padx=8)
 
+    # ── HW Bar ──────────────────────────────────
     def _build_hw_bar(self):
-        """Compact hardware status bar at the top."""
-        bar = tk.Frame(self.root, bg='#161b22', height=36)
-        bar.pack(fill='x', padx=20, pady=(0, 6))
+        bar = tk.Frame(self.root, bg='#161b22', height=34)
+        bar.pack(fill='x', padx=20, pady=(0,4))
         bar.pack_propagate(False)
 
-        def hw_item(parent, label, color):
-            f = tk.Frame(parent, bg='#161b22')
-            f.pack(side='left', padx=16, pady=4)
-            tk.Label(f, text=label, bg='#161b22', fg='#484f58',
-                     font=('Consolas', 8)).pack(side='left')
+        def item(parent, lbl, color):
+            f = tk.Frame(parent, bg='#161b22'); f.pack(side='left', padx=12, pady=4)
+            tk.Label(f, text=lbl, bg='#161b22', fg='#484f58',
+                     font=('Consolas',8)).pack(side='left')
             var = tk.DoubleVar()
-            pb = ttk.Progressbar(f, variable=var, maximum=100, length=80,
-                                 style=f'{color}.Horizontal.TProgressbar')
-            pb.pack(side='left', padx=4)
-            lbl = tk.Label(f, text="0%", bg='#161b22', fg=color,
-                           font=('Consolas', 8), width=5)
-            lbl.pack(side='left')
-            return var, lbl
+            ttk.Progressbar(f, variable=var, maximum=100, length=70,
+                            style='Horizontal.TProgressbar').pack(side='left', padx=4)
+            lbl2 = tk.Label(f, text="0%", bg='#161b22', fg=color,
+                            font=('Consolas',8), width=5)
+            lbl2.pack(side='left')
+            return var, lbl2
 
-        self.hw_cpu_var,  self.hw_cpu_lbl  = hw_item(bar, "CPU", "#3fb950")
-        self.hw_ram_var,  self.hw_ram_lbl  = hw_item(bar, "RAM", "#58a6ff")
+        self.hw_cpu_v, self.hw_cpu_l = item(bar, "CPU", "#3fb950")
+        self.hw_ram_v, self.hw_ram_l = item(bar, "RAM", "#58a6ff")
+        tk.Label(bar, text=f"Cores: {CPU_COUNT}", bg='#161b22', fg='#f7b731',
+                 font=('Consolas',8)).pack(side='left', padx=12)
+        self.hw_wlbl = tk.Label(bar, text="Workers: 1", bg='#161b22',
+                                 fg='#c9d1d9', font=('Consolas',8))
+        self.hw_wlbl.pack(side='left', padx=8)
+        self.hw_safe = tk.Label(bar, text="● SAFE", bg='#161b22',
+                                 fg='#3fb950', font=('Consolas',8,'bold'))
+        self.hw_safe.pack(side='right', padx=14)
 
-        # Cores info
-        tk.Label(bar, text=f"Cores: {CPU_COUNT}",
-                 bg='#161b22', fg='#f7b731',
-                 font=('Consolas', 8)).pack(side='left', padx=16)
-
-        # Workers indicator
-        self.hw_workers_lbl = tk.Label(bar, text="Workers: 1",
-                                       bg='#161b22', fg='#c9d1d9',
-                                       font=('Consolas', 8))
-        self.hw_workers_lbl.pack(side='left', padx=8)
-
-        # Safety indicator
-        self.hw_safety_lbl = tk.Label(bar, text="● SAFE",
-                                      bg='#161b22', fg='#3fb950',
-                                      font=('Consolas', 8, 'bold'))
-        self.hw_safety_lbl.pack(side='right', padx=16)
-
-    def _start_hardware_monitor(self):
-        """Updates hardware monitor every 2 seconds."""
-        def update():
+    def _start_hw_monitor(self):
+        def loop():
             while True:
                 try:
-                    cpu = get_cpu_usage()
-                    ram = get_ram_usage()
-
-                    self.hw_cpu_var.set(cpu)
-                    self.hw_ram_var.set(ram)
-                    self.hw_cpu_lbl.config(text=f"{cpu:.0f}%")
-                    self.hw_ram_lbl.config(text=f"{ram:.0f}%")
-
-                    # Safety indicator
+                    cpu = psutil.cpu_percent(interval=0.5)
+                    ram = psutil.virtual_memory().percent
+                    self.hw_cpu_v.set(cpu); self.hw_cpu_l.config(text=f"{cpu:.0f}%")
+                    self.hw_ram_v.set(ram); self.hw_ram_l.config(text=f"{ram:.0f}%")
                     if cpu > 90 or ram > 90:
-                        self.hw_safety_lbl.config(text="● HIGH LOAD", fg='#da3633')
+                        self.hw_safe.config(text="● HIGH LOAD", fg='#da3633')
                     elif cpu > 70 or ram > 75:
-                        self.hw_safety_lbl.config(text="● MODERATE", fg='#f7b731')
+                        self.hw_safe.config(text="● MODERATE",  fg='#f7b731')
                     else:
-                        self.hw_safety_lbl.config(text="● SAFE", fg='#3fb950')
-
+                        self.hw_safe.config(text="● SAFE",      fg='#3fb950')
                     self.root.update_idletasks()
                 except Exception:
                     pass
                 time.sleep(2)
+        threading.Thread(target=loop, daemon=True).start()
 
-        t = threading.Thread(target=update, daemon=True)
-        t.start()
-
+    # ── Tab: Recovery ────────────────────────────
     def _tab_recovery(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="  🔑  Recovery  ")
 
-        mode_frame = ttk.LabelFrame(tab, text="  RECOVERY MODE  ")
-        mode_frame.pack(fill='x', padx=12, pady=(12, 6))
-        self.mode_var = tk.StringVar(value="1_missing_unknown")
-        modes = [
-            ("1 missing word — UNKNOWN position (tests all)", "1_missing_unknown"),
-            ("1 missing word — KNOWN position", "1_missing_known"),
-            ("2 missing words — KNOWN positions", "2_missing_known"),
-            ("Multiple words with '?' for unknowns", "partial"),
-        ]
-        for text, val in modes:
-            tk.Radiobutton(mode_frame, text=text, variable=self.mode_var, value=val,
-                           bg='#0d1117', fg='#c9d1d9', selectcolor='#161b22',
-                           activebackground='#0d1117', activeforeground='#f7b731',
-                           font=('Consolas', 10),
-                           command=self._on_mode_change).pack(anchor='w', padx=12, pady=2)
+        # ── Seed size ──
+        top = tk.Frame(tab, bg='#0d1117')
+        top.pack(fill='x', padx=12, pady=(10,4))
+        self._label(top, "Seed size:").pack(side='left')
+        self.seed_size_var = tk.IntVar(value=24)
+        ttk.Combobox(top, textvariable=self.seed_size_var, width=5,
+                     values=[12,15,18,21,24], state='readonly').pack(side='left', padx=6)
+        self._label(top, "words total  —  How many words do you have:").pack(side='left', padx=(10,4))
+        self.known_count_var = tk.IntVar(value=23)
+        tk.Spinbox(top, from_=1, to=24, textvariable=self.known_count_var,
+                   width=4, bg='#161b22', fg='#c9d1d9', font=('Consolas',10),
+                   buttonbackground='#1f2937',
+                   command=self._update_word_grid).pack(side='left')
+        self._label(top, "  (fill only the words you have — leave the rest blank)").pack(side='left', padx=8)
 
-        words_frame = ttk.LabelFrame(tab, text="  SEED WORDS  ")
-        words_frame.pack(fill='x', padx=12, pady=6)
-        tk.Label(words_frame,
-                 text="Paste your words separated by spaces. Use '?' for unknown positions (partial mode):",
-                 bg='#0d1117', fg='#8b949e', font=('Consolas', 9)).pack(anchor='w', padx=8, pady=(4,0))
-        self.words_entry = tk.Text(words_frame, height=3, bg='#161b22', fg='#c9d1d9',
-                                   font=('Consolas', 11), relief='flat', bd=6,
-                                   insertbackground='#f7b731', highlightthickness=1,
-                                   highlightcolor='#f7b731', highlightbackground='#30363d')
-        self.words_entry.pack(fill='x', padx=8, pady=6)
+        # ── Word grid ──
+        wf = ttk.LabelFrame(tab, text="  ENTER YOUR WORDS IN ORDER  ")
+        wf.pack(fill='x', padx=12, pady=4)
 
-        pos_frame = tk.Frame(tab, bg='#0d1117')
-        pos_frame.pack(fill='x', padx=12, pady=2)
-        tk.Label(pos_frame, text="Position of 1st missing word (0 = unknown):",
-                 bg='#0d1117', fg='#8b949e', font=('Consolas', 9)).pack(side='left')
-        self.pos1_var = tk.IntVar(value=0)
-        tk.Spinbox(pos_frame, from_=0, to=24, textvariable=self.pos1_var,
-                   width=4, bg='#161b22', fg='#c9d1d9', font=('Consolas', 10),
-                   buttonbackground='#1f2937').pack(side='left', padx=6)
-        tk.Label(pos_frame, text="Position of 2nd missing word:",
-                 bg='#0d1117', fg='#8b949e', font=('Consolas', 9)).pack(side='left', padx=(20,0))
-        self.pos2_var = tk.IntVar(value=0)
-        self.pos2_spin = tk.Spinbox(pos_frame, from_=0, to=24, textvariable=self.pos2_var,
-                                    width=4, bg='#161b22', fg='#c9d1d9', font=('Consolas', 10),
-                                    buttonbackground='#1f2937', state='disabled')
-        self.pos2_spin.pack(side='left', padx=6)
+        self._label(wf,
+            "Fill in the words you have. Leave blank the ones you don't remember.",
+            fg='#484f58').pack(anchor='w', padx=10, pady=(4,6))
 
-        cred_frame = ttk.LabelFrame(tab, text="  CREDENTIALS  ")
-        cred_frame.pack(fill='x', padx=12, pady=6)
+        self.word_entries = []
+        self.grid_frame = tk.Frame(wf, bg='#0d1117')
+        self.grid_frame.pack(fill='x', padx=8, pady=(0,8))
+        self._build_word_grid(24)
 
-        row1 = tk.Frame(cred_frame, bg='#0d1117')
-        row1.pack(fill='x', padx=8, pady=4)
-        tk.Label(row1, text="Passphrase:", width=22, anchor='w').pack(side='left')
-        self.pass_entry = self._entry(row1, show='•', width=30)
-        self.pass_entry.pack(side='left', padx=4)
+        # ── Smart hints ──
+        hint_frame = ttk.LabelFrame(tab, text="  SMART HINTS — help narrow the search (optional)  ")
+        hint_frame.pack(fill='x', padx=12, pady=4)
+
+        h1 = tk.Frame(hint_frame, bg='#0d1117'); h1.pack(fill='x', padx=10, pady=4)
+        self._label(h1, "Missing word starts with:").pack(side='left')
+        self.hint_starts = self._entry(h1, w=8)
+        self.hint_starts.pack(side='left', padx=6)
+        self._label(h1, "  Has exactly N letters (0 = any):").pack(side='left', padx=(16,4))
+        self.hint_length_var = tk.IntVar(value=0)
+        tk.Spinbox(h1, from_=0, to=10, textvariable=self.hint_length_var,
+                   width=4, bg='#161b22', fg='#c9d1d9', font=('Consolas',10),
+                   buttonbackground='#1f2937').pack(side='left')
+
+        h2 = tk.Frame(hint_frame, bg='#0d1117'); h2.pack(fill='x', padx=10, pady=(2,8))
+        self._label(h2, "I may have misspelled a word — what did I write?").pack(side='left')
+        self.hint_typo = self._entry(h2, w=20)
+        self.hint_typo.pack(side='left', padx=6)
+        self._label(h2, "  (tool will find similar BIP39 words automatically)", fg='#3fb950').pack(side='left')
+
+        # ── Position hint ──
+        pos_frame = ttk.LabelFrame(tab, text="  WHERE ARE THE MISSING WORDS?  ")
+        pos_frame.pack(fill='x', padx=12, pady=4)
+
+        self.pos_mode_var = tk.StringVar(value="unknown")
+        tk.Radiobutton(pos_frame,
+                       text="I don't know the positions — test all automatically",
+                       variable=self.pos_mode_var, value="unknown",
+                       bg='#0d1117', fg='#c9d1d9', selectcolor='#161b22',
+                       activebackground='#0d1117', activeforeground='#f7b731',
+                       font=('Consolas',10),
+                       command=self._on_pos_mode).pack(anchor='w', padx=12, pady=2)
+        tk.Radiobutton(pos_frame,
+                       text="I think I know the positions:",
+                       variable=self.pos_mode_var, value="known",
+                       bg='#0d1117', fg='#c9d1d9', selectcolor='#161b22',
+                       activebackground='#0d1117', activeforeground='#f7b731',
+                       font=('Consolas',10),
+                       command=self._on_pos_mode).pack(anchor='w', padx=12, pady=2)
+
+        pos_row = tk.Frame(pos_frame, bg='#0d1117')
+        pos_row.pack(fill='x', padx=28, pady=(0,8))
+        self._label(pos_row, "Positions (e.g.: 5 12 18):").pack(side='left')
+        self.pos_entry = self._entry(pos_row, w=30)
+        self.pos_entry.pack(side='left', padx=6)
+        self._label(pos_row, "  separate by space", fg='#484f58').pack(side='left')
+        self.pos_entry.config(state='disabled')
+
+        # ── Credentials ──
+        cred = ttk.LabelFrame(tab, text="  CREDENTIALS  ")
+        cred.pack(fill='x', padx=12, pady=4)
+
+        r1 = tk.Frame(cred, bg='#0d1117'); r1.pack(fill='x', padx=10, pady=4)
+        self._label(r1, "Passphrase (extra password):", size=10).pack(side='left', anchor='w')
+        self.pass_entry = self._entry(r1, show='•', w=28)
+        self.pass_entry.pack(side='left', padx=6)
         self.show_pass = tk.BooleanVar()
-        tk.Checkbutton(row1, text="show", variable=self.show_pass,
+        tk.Checkbutton(r1, text="show", variable=self.show_pass,
                        bg='#0d1117', fg='#8b949e', selectcolor='#161b22',
-                       activebackground='#0d1117', font=('Consolas', 9),
+                       activebackground='#0d1117', font=('Consolas',9),
                        command=lambda: self.pass_entry.config(
                            show='' if self.show_pass.get() else '•')).pack(side='left')
+        self._label(r1, "  (leave empty if you didn't use one)", fg='#484f58').pack(side='left')
 
-        row2 = tk.Frame(cred_frame, bg='#0d1117')
-        row2.pack(fill='x', padx=8, pady=4)
-        tk.Label(row2, text="Bitcoin address:", width=22, anchor='w').pack(side='left')
-        self.addr_entry = self._entry(row2, width=50)
-        self.addr_entry.pack(side='left', padx=4)
+        r2 = tk.Frame(cred, bg='#0d1117'); r2.pack(fill='x', padx=10, pady=4)
+        self._label(r2, "Bitcoin address (bc1q / 1... / 3...):", size=10).pack(side='left')
+        self.addr_entry = self._entry(r2, w=50)
+        self.addr_entry.pack(side='left', padx=6)
 
-        row3 = tk.Frame(cred_frame, bg='#0d1117')
-        row3.pack(fill='x', padx=8, pady=4)
-        tk.Label(row3, text="Address type:", width=22, anchor='w').pack(side='left')
+        r3 = tk.Frame(cred, bg='#0d1117'); r3.pack(fill='x', padx=10, pady=(4,8))
+        self._label(r3, "Address type:", size=10).pack(side='left')
         self.path_var = tk.StringVar(value="bip84")
-        ttk.Combobox(row3, textvariable=self.path_var, width=20,
+        ttk.Combobox(r3, textvariable=self.path_var, width=18,
                      values=["bip84 (bc1q...)", "bip44 (1...)", "bip49 (3...)"],
-                     state='readonly').pack(side='left', padx=4)
-        tk.Label(row3, text="Address indexes:", padx=12).pack(side='left')
-        self.addr_limit_var = tk.IntVar(value=10)
-        tk.Spinbox(row3, from_=1, to=50, textvariable=self.addr_limit_var,
-                   width=4, bg='#161b22', fg='#c9d1d9', font=('Consolas', 10),
+                     state='readonly').pack(side='left', padx=6)
+        self._label(r3, "  Indexes:", size=10).pack(side='left', padx=(12,4))
+        self.addr_lim = tk.IntVar(value=10)
+        tk.Spinbox(r3, from_=1, to=50, textvariable=self.addr_lim,
+                   width=4, bg='#161b22', fg='#c9d1d9', font=('Consolas',10),
                    buttonbackground='#1f2937').pack(side='left')
         self.change_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(row3, text="test change path too",
-                       variable=self.change_var, bg='#0d1117', fg='#8b949e',
-                       selectcolor='#161b22', activebackground='#0d1117',
-                       font=('Consolas', 9)).pack(side='left', padx=8)
+        tk.Checkbutton(r3, text="  test change path too", variable=self.change_var,
+                       bg='#0d1117', fg='#8b949e', selectcolor='#161b22',
+                       activebackground='#0d1117', font=('Consolas',9)).pack(side='left', padx=8)
 
+    def _build_word_grid(self, n):
+        for w in self.grid_frame.winfo_children():
+            w.destroy()
+        self.word_entries = []
+        cols = 6
+        for i in range(n):
+            row, col = divmod(i, cols)
+            cell = tk.Frame(self.grid_frame, bg='#0d1117')
+            cell.grid(row=row, column=col, padx=4, pady=2, sticky='w')
+            tk.Label(cell, text=f"{i+1:02d}.", bg='#0d1117', fg='#484f58',
+                     font=('Consolas',9), width=3).pack(side='left')
+            e = tk.Entry(cell, width=10, bg='#161b22', fg='#c9d1d9',
+                         insertbackground='#f7b731', relief='flat', bd=4,
+                         font=('Consolas',10), highlightthickness=1,
+                         highlightcolor='#f7b731', highlightbackground='#30363d')
+            e.pack(side='left')
+            self.word_entries.append(e)
+
+    def _update_word_grid(self):
+        n = self.seed_size_var.get()
+        self._build_word_grid(n)
+
+    def _on_pos_mode(self):
+        mode = self.pos_mode_var.get()
+        self.pos_entry.config(state='normal' if mode == 'known' else 'disabled')
+
+    # ── Tab: Hardware ────────────────────────────
     def _tab_hardware(self):
-        """Full hardware control tab."""
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="  ⚡  Hardware Control  ")
 
-        # CPU Workers
-        cpu_frame = ttk.LabelFrame(tab, text="  CPU WORKERS  ")
-        cpu_frame.pack(fill='x', padx=12, pady=(12, 6))
+        cpu_f = ttk.LabelFrame(tab, text="  CPU WORKERS  ")
+        cpu_f.pack(fill='x', padx=12, pady=(12,6))
+        self._label(cpu_f,
+            f"Your CPU has {CPU_COUNT} cores. Choose how many to dedicate to recovery:",
+            fg='#8b949e').pack(anchor='w', padx=12, pady=(6,2))
 
-        tk.Label(cpu_frame,
-                 text=f"Your CPU has {CPU_COUNT} cores available. Choose how many to use for recovery:",
-                 bg='#0d1117', fg='#8b949e', font=('Consolas', 9)).pack(anchor='w', padx=12, pady=(6,2))
+        sf = tk.Frame(cpu_f, bg='#0d1117'); sf.pack(fill='x', padx=12, pady=6)
+        self.workers_var = tk.IntVar(value=max(1, CPU_COUNT//2))
+        self.w_lbl = tk.Label(sf, text=f"Workers: {self.workers_var.get()}",
+                               bg='#0d1117', fg='#f7b731',
+                               font=('Consolas',12,'bold'), width=14)
+        self.w_lbl.pack(side='left')
 
-        slider_frame = tk.Frame(cpu_frame, bg='#0d1117')
-        slider_frame.pack(fill='x', padx=12, pady=6)
+        def on_slide(v):
+            n = int(float(v))
+            self.workers_var.set(n)
+            self.w_lbl.config(text=f"Workers: {n}")
+            self.hw_wlbl.config(text=f"Workers: {n}")
+            pct = int(n / CPU_COUNT * 100)
+            desc = "🟢 Light" if pct<=40 else "🟡 Moderate" if pct<=70 else "🔴 Heavy"
+            self.w_desc.config(text=f"{pct}% of CPU  {desc}")
 
-        self.workers_var = tk.IntVar(value=max(1, CPU_COUNT // 2))
-        self.workers_label = tk.Label(slider_frame,
-                                      text=f"Workers: {self.workers_var.get()}",
-                                      bg='#0d1117', fg='#f7b731',
-                                      font=('Consolas', 12, 'bold'), width=14)
-        self.workers_label.pack(side='left')
+        tk.Scale(sf, from_=1, to=CPU_COUNT, orient='horizontal',
+                 variable=self.workers_var, command=on_slide, length=400,
+                 bg='#0d1117', fg='#c9d1d9', troughcolor='#161b22',
+                 activebackground='#f7b731', highlightthickness=0,
+                 sliderrelief='flat', font=('Consolas',9)).pack(side='left', padx=10)
+        self.w_desc = self._label(cpu_f, "")
+        self.w_desc.pack(anchor='w', padx=12, pady=(0,4))
+        on_slide(self.workers_var.get())
 
-        def on_slider(val):
-            v = int(float(val))
-            self.workers_var.set(v)
-            self.workers_label.config(text=f"Workers: {v}")
-            self.hw_workers_lbl.config(text=f"Workers: {v}")
-            pct = int((v / CPU_COUNT) * 100)
-            desc = "🟢 Light" if pct <= 40 else "🟡 Moderate" if pct <= 70 else "🔴 Heavy"
-            self.workers_desc.config(text=f"{pct}% of CPU capacity  {desc}")
+        pf = ttk.LabelFrame(tab, text="  PRESETS  ")
+        pf.pack(fill='x', padx=12, pady=6)
+        row = tk.Frame(pf, bg='#0d1117'); row.pack(fill='x', padx=12, pady=8)
 
-        self.workers_slider = tk.Scale(
-            slider_frame, from_=1, to=CPU_COUNT,
-            orient='horizontal', variable=self.workers_var,
-            command=on_slider, length=400,
-            bg='#0d1117', fg='#c9d1d9', troughcolor='#161b22',
-            activebackground='#f7b731', highlightthickness=0,
-            sliderrelief='flat', font=('Consolas', 9))
-        self.workers_slider.pack(side='left', padx=12)
+        def preset_btn(text, workers, color):
+            tk.Button(row, text=text, width=28,
+                      command=lambda: (self.workers_var.set(workers),
+                                       on_slide(workers)),
+                      bg='#161b22', fg='#c9d1d9', activebackground=color,
+                      relief='flat', bd=1, padx=8, pady=8,
+                      font=('Consolas',9), cursor='hand2',
+                      justify='left').pack(side='left', padx=6)
 
-        self.workers_desc = tk.Label(cpu_frame, text="",
-                                     bg='#0d1117', fg='#8b949e',
-                                     font=('Consolas', 9))
-        self.workers_desc.pack(anchor='w', padx=12, pady=(0,4))
-        on_slider(self.workers_var.get())
+        preset_btn(f"🟢 Safe Mode\n(1 worker — PC stays responsive)", 1, '#238636')
+        preset_btn(f"🟡 Balanced\n({max(1,CPU_COUNT//2)} workers — recommended)", max(1,CPU_COUNT//2), '#b08800')
+        preset_btn(f"🔴 Maximum Power\n({CPU_COUNT} workers — PC may slow down)", CPU_COUNT, '#da3633')
 
-        # Presets
-        preset_frame = ttk.LabelFrame(tab, text="  PRESETS — Choose based on your situation  ")
-        preset_frame.pack(fill='x', padx=12, pady=6)
+        wf = ttk.LabelFrame(tab, text="  SAFETY GUIDELINES  ")
+        wf.pack(fill='both', expand=True, padx=12, pady=6)
+        tk.Label(wf, text="""
+  🌡️  More workers = more heat. Avoid Maximum on laptops or PCs with poor ventilation.
+  💾  Each worker uses ~50–100 MB RAM. Use Safe Mode if you have less than 4 GB RAM.
+  🔋  On battery? Use Safe Mode — Maximum Power drains it fast.
+  🖥️  Balanced lets you use your PC normally while recovery runs in the background.
+  ✅  Start with Balanced. Increase only if the PC handles it well.
+        """, bg='#0d1117', fg='#8b949e', font=('Consolas',9),
+                 justify='left').pack(anchor='w', padx=8)
 
-        presets = [
-            ("🟢  Safe Mode\n(1 worker — PC stays responsive)",
-             1, '#238636'),
-            (f"🟡  Balanced\n({max(1, CPU_COUNT//2)} workers — recommended for most users)",
-             max(1, CPU_COUNT//2), '#b08800'),
-            (f"🔴  Maximum Power\n({CPU_COUNT} workers — PC may slow down during recovery)",
-             CPU_COUNT, '#da3633'),
-        ]
-        pf = tk.Frame(preset_frame, bg='#0d1117')
-        pf.pack(fill='x', padx=12, pady=8)
-        for label, workers, color in presets:
-            tk.Button(pf, text=label, width=32,
-                      command=lambda w=workers: (
-                          self.workers_var.set(w),
-                          self.workers_slider.set(w),
-                          on_slider(w)),
-                      bg='#161b22', fg='#c9d1d9',
-                      activebackground=color,
-                      relief='flat', bd=1, padx=10, pady=8,
-                      font=('Consolas', 9), cursor='hand2',
-                      justify='left').pack(side='left', padx=8)
-
-        # Safety warnings
-        warn_frame = ttk.LabelFrame(tab, text="  SAFETY GUIDELINES  ")
-        warn_frame.pack(fill='both', expand=True, padx=12, pady=6)
-
-        warnings = """
-  ⚠️  IMPORTANT — Read before choosing Maximum Power:
-
-  🌡️  TEMPERATURE
-      More workers = more heat generated by the CPU.
-      If your PC has poor ventilation or is a laptop,
-      avoid using more than 50% of cores.
-      Stop immediately if the machine becomes very hot.
-
-  💾  RAM MEMORY
-      Each worker uses approximately 50–100 MB of RAM.
-      If your PC has less than 4 GB RAM, use Safe Mode.
-
-  🔋  LAPTOPS
-      Running on battery? Use Safe Mode (1–2 workers).
-      Maximum Power on battery drains it very fast
-      and may cause thermal throttling.
-
-  🖥️  WHILE RECOVERY IS RUNNING
-      The more workers you use, the less responsive
-      your PC will be for other tasks.
-      Balanced mode lets you use your PC normally.
-
-  ✅  RECOMMENDATION FOR MOST USERS
-      Start with Balanced mode.
-      If PC handles it fine, increase workers.
-      Watch the CPU/RAM indicators at the top.
-        """
-        tk.Label(warn_frame, text=warnings, bg='#0d1117', fg='#8b949e',
-                 font=('Consolas', 9), justify='left').pack(anchor='w', padx=8)
-
-    def _tab_analise(self):
+    # ── Tab: Analysis ────────────────────────────
+    def _tab_analysis(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="  📊  Feasibility Analysis  ")
 
         ctrl = ttk.LabelFrame(tab, text="  WHAT DO YOU HAVE?  ")
-        ctrl.pack(fill='x', padx=12, pady=(12, 6))
+        ctrl.pack(fill='x', padx=12, pady=(12,6))
 
-        r1 = tk.Frame(ctrl, bg='#0d1117')
-        r1.pack(fill='x', padx=12, pady=6)
-        tk.Label(r1, text="Seed size:", width=22, anchor='w').pack(side='left')
-        self.seed_size_var = tk.IntVar(value=24)
-        ttk.Combobox(r1, textvariable=self.seed_size_var, width=6,
-                     values=[12, 15, 18, 21, 24], state='readonly').pack(side='left', padx=4)
-        tk.Label(r1, text="total words", bg='#0d1117', fg='#8b949e',
-                 font=('Consolas', 9)).pack(side='left', padx=6)
+        r1 = tk.Frame(ctrl, bg='#0d1117'); r1.pack(fill='x', padx=12, pady=6)
+        self._label(r1, "Seed size:", size=10).pack(side='left')
+        self.an_seed = tk.IntVar(value=24)
+        ttk.Combobox(r1, textvariable=self.an_seed, width=5,
+                     values=[12,15,18,21,24], state='readonly').pack(side='left', padx=6)
+        self._label(r1, "  Words you have:", size=10).pack(side='left', padx=(12,4))
+        self.an_known = tk.IntVar(value=23)
+        tk.Spinbox(r1, from_=0, to=24, textvariable=self.an_known,
+                   width=4, bg='#161b22', fg='#c9d1d9', font=('Consolas',10),
+                   buttonbackground='#1f2937').pack(side='left')
 
-        r2 = tk.Frame(ctrl, bg='#0d1117')
-        r2.pack(fill='x', padx=12, pady=4)
-        tk.Label(r2, text="Words you have:", width=22, anchor='w').pack(side='left')
-        self.known_words_var = tk.IntVar(value=23)
-        tk.Spinbox(r2, from_=0, to=24, textvariable=self.known_words_var,
-                   width=4, bg='#161b22', fg='#c9d1d9', font=('Consolas', 10),
-                   buttonbackground='#1f2937').pack(side='left', padx=4)
+        r2 = tk.Frame(ctrl, bg='#0d1117'); r2.pack(fill='x', padx=12, pady=4)
+        self.an_pos  = tk.BooleanVar(value=False)
+        self.an_pass = tk.BooleanVar(value=True)
+        self.an_addr = tk.BooleanVar(value=True)
+        self.an_bip  = tk.BooleanVar(value=True)
+        self.an_hint = tk.BooleanVar(value=False)
 
-        r3 = tk.Frame(ctrl, bg='#0d1117')
-        r3.pack(fill='x', padx=12, pady=4)
-        self.tem_posicao_var  = tk.BooleanVar(value=False)
-        self.tem_senha_var    = tk.BooleanVar(value=True)
-        self.tem_endereco_var = tk.BooleanVar(value=True)
-        self.tem_deriv_var    = tk.BooleanVar(value=True)
+        def cb(p, txt, var):
+            tk.Checkbutton(p, text=txt, variable=var, bg='#0d1117', fg='#c9d1d9',
+                           selectcolor='#161b22', activebackground='#0d1117',
+                           activeforeground='#f7b731',
+                           font=('Consolas',10)).pack(side='left', padx=10)
 
-        def cb(parent, text, var):
-            tk.Checkbutton(parent, text=text, variable=var,
-                           bg='#0d1117', fg='#c9d1d9', selectcolor='#161b22',
-                           activebackground='#0d1117', activeforeground='#f7b731',
-                           font=('Consolas', 10)).pack(side='left', padx=10)
+        cb(r2, "Know position(s)", self.an_pos)
+        cb(r2, "Have passphrase",  self.an_pass)
+        cb(r2, "Have address",     self.an_addr)
+        r3 = tk.Frame(ctrl, bg='#0d1117'); r3.pack(fill='x', padx=12, pady=(2,8))
+        cb(r3, "Know derivation type", self.an_bip)
+        cb(r3, "Have word pattern hint", self.an_hint)
 
-        cb(r3, "Know word position", self.tem_posicao_var)
-        cb(r3, "Have passphrase", self.tem_senha_var)
-        r4 = tk.Frame(ctrl, bg='#0d1117')
-        r4.pack(fill='x', padx=12, pady=(2, 8))
-        cb(r4, "Have public address", self.tem_endereco_var)
-        cb(r4, "Know derivation type", self.tem_deriv_var)
+        self._btn(ctrl, "  CALCULATE ANALYSIS  ", self._run_analysis,
+                  '#1f6feb', 'white').pack(pady=(0,10))
 
-        self._btn(ctrl, "  CALCULATE ANALYSIS  ", self._calcular_analise,
-                  color='#1f6feb', fg='white').pack(pady=(0, 10))
-
-        result_frame = ttk.LabelFrame(tab, text="  RESULT  ")
-        result_frame.pack(fill='both', expand=True, padx=12, pady=6)
-        self.analise_box = scrolledtext.ScrolledText(
-            result_frame, height=16, bg='#010409', fg='#c9d1d9',
-            font=('Consolas', 10), relief='flat', bd=4,
+        rf = ttk.LabelFrame(tab, text="  RESULT  ")
+        rf.pack(fill='both', expand=True, padx=12, pady=6)
+        self.an_box = scrolledtext.ScrolledText(
+            rf, height=14, bg='#010409', fg='#c9d1d9',
+            font=('Consolas',10), relief='flat', bd=4,
             insertbackground='#f7b731', state='disabled')
-        self.analise_box.pack(fill='both', expand=True, padx=4, pady=4)
-        self.root.after(300, self._calcular_analise)
+        self.an_box.pack(fill='both', expand=True, padx=4, pady=4)
+        self.root.after(400, self._run_analysis)
 
-    def _calcular_analise(self):
-        total       = self.seed_size_var.get()
-        conhecidas  = min(self.known_words_var.get(), total)
-        workers     = self.workers_var.get() if hasattr(self, 'workers_var') else 1
-        texto, cor, nivel = gerar_analise(
-            conhecidas, total,
-            self.tem_senha_var.get(),
-            self.tem_endereco_var.get(),
-            self.tem_deriv_var.get(),
-            self.tem_posicao_var.get(),
-            workers)
+    def _run_analysis(self):
+        total    = self.an_seed.get()
+        known    = min(self.an_known.get(), total)
+        missing  = total - known
+        workers  = self.workers_var.get() if hasattr(self, 'workers_var') else 1
+        has_hint = self.an_hint.get()
 
-        self.analise_box.config(state='normal')
-        self.analise_box.delete('1.0', 'end')
-        self.analise_box.tag_config("nivel", foreground=cor, font=('Consolas', 10, 'bold'))
-        self.analise_box.tag_config("ok",    foreground="#3fb950")
-        self.analise_box.tag_config("warn",  foreground="#f7b731")
-        self.analise_box.tag_config("bad",   foreground="#da3633")
-        self.analise_box.tag_config("tip",   foreground="#58a6ff")
-        self.analise_box.tag_config("normal",foreground="#c9d1d9")
+        # Estimate combinations with smart hints applied
+        base = 2048
+        if has_hint: base = int(base * 0.05)  # pattern reduces ~95%
+        combos = base ** max(1, missing)
+        level, color, secs = feasibility(combos, workers)
+        tempo = fmt_time(secs)
 
-        for linha in texto.split("\n"):
-            tag = "normal"
-            if "✅" in linha: tag = "ok"
-            elif "❌" in linha: tag = "bad"
-            elif nivel in linha: tag = "nivel"
-            elif "➕" in linha or "💡" in linha: tag = "tip"
-            elif "🟢" in linha: tag = "ok"
-            elif "🟡" in linha or "⚠" in linha: tag = "warn"
-            elif "🟠" in linha or "🔴" in linha or "💀" in linha: tag = "bad"
-            self.analise_box.insert('end', linha + "\n", tag)
-        self.analise_box.config(state='disabled')
+        lines = ["━━━  SITUATION ANALYSIS  ━━━", ""]
+        lines += [f"  Seed size        : {total} words",
+                  f"  You have         : {known} words",
+                  f"  Missing          : {missing} word(s)",
+                  f"  Position known   : {'Yes ✅' if self.an_pos.get() else 'No ❌'}",
+                  f"  Has passphrase   : {'Yes ✅' if self.an_pass.get() else 'No ❌'}",
+                  f"  Has address      : {'Yes ✅' if self.an_addr.get() else 'No ❌  ← important!'}",
+                  f"  Has derivation   : {'Yes ✅' if self.an_bip.get() else 'No ❌'}",
+                  f"  Word hint active : {'Yes ✅ (~95% fewer candidates' if has_hint else 'No'})",
+                  f"  Workers          : {workers} cores", "",
+                  f"  Combinations     : {combos:,}",
+                  f"  Estimated time   : {tempo}",
+                  f"  Feasibility      : {level}", ""]
 
+        if missing == 0:
+            lines += ["  ℹ️  You have all words! Check passphrase and derivation."]
+        elif missing == 1:
+            lines += ["  🟢 Excellent. One missing word — very fast to recover."]
+        elif missing == 2:
+            lines += ["  🟡 Possible. May take hours without hints, minutes with hints."]
+        elif missing == 3:
+            lines += ["  🟠 Hard. Use all hints available to speed up."]
+        elif missing <= 5:
+            lines += ["  🔴 Very hard. Hints are essential. May take days."]
+        else:
+            lines += ["  💀 Not feasible without GPU hardware."]
+
+        lines += ["", "  💡 What still helps:"]
+        if not self.an_addr.get():
+            lines.append("   ➕ Public address → essential to confirm matches")
+        if not self.an_pos.get() and missing >= 1:
+            lines.append("   ➕ Position of missing words → huge speedup")
+        if not has_hint:
+            lines.append("   ➕ Word pattern hint → reduces candidates by ~95%")
+        if missing > 1:
+            lines.append(f"   ➕ Each extra word remembered divides time by {base:,}")
+        if workers < CPU_COUNT:
+            lines.append(f"   ➕ More CPU workers → you have {CPU_COUNT} cores available")
+
+        self.an_box.config(state='normal')
+        self.an_box.delete('1.0', 'end')
+        self.an_box.tag_config("ok",  foreground="#3fb950")
+        self.an_box.tag_config("bad", foreground="#da3633")
+        self.an_box.tag_config("tip", foreground="#58a6ff")
+        self.an_box.tag_config("lvl", foreground=color, font=('Consolas',10,'bold'))
+        self.an_box.tag_config("dim", foreground="#c9d1d9")
+        for ln in lines:
+            tag = "dim"
+            if "✅" in ln: tag = "ok"
+            elif "❌" in ln: tag = "bad"
+            elif level in ln: tag = "lvl"
+            elif "➕" in ln or "💡" in ln: tag = "tip"
+            elif any(x in ln for x in ["🟢","🟡","🟠","🔴","💀"]): tag = "ok" if "🟢" in ln else "bad"
+            self.an_box.insert('end', ln+"\n", tag)
+        self.an_box.config(state='disabled')
+
+    # ── Tab: About ───────────────────────────────
     def _tab_about(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="  ℹ  About  ")
-        about = """
-
+        tk.Label(tab, text="""
 
     ₿  BIP39 Bitcoin Wallet Recovery Tool
     ═══════════════════════════════════════════════════
@@ -877,232 +684,192 @@ class BitcoinRecoveryApp:
     Open source tool to recover Bitcoin wallets
     from incomplete BIP39 seed phrases.
 
-    Supports:
-    ├─ BIP84  →  Native SegWit addresses (bc1q...)
-    ├─ BIP44  →  Legacy addresses (1...)
-    └─ BIP49  →  SegWit addresses (3...)
+    Smart search optimizations:
+    ├─ BIP39 checksum filter    → eliminates invalid combinations instantly
+    ├─ Pattern filter           → reduces candidates by prefix / word length
+    └─ Neighborhood search      → finds misspelled words automatically
 
-    Recovery modes:
-    ├─ 1 missing word (unknown position)
-    ├─ 1 missing word (known position)
-    ├─ 2 missing words (known positions)
-    └─ Multiple partially known words
+    Derivations:
+    ├─ BIP84 → bc1q...   (Native SegWit)
+    ├─ BIP44 → 1...      (Legacy)
+    └─ BIP49 → 3...      (SegWit)
 
-    Hardware Control:
-    ├─ Multi-core CPU support
-    ├─ Adjustable worker count
-    ├─ Real-time CPU/RAM monitoring
-    └─ Safety presets (Safe / Balanced / Maximum)
+    Hardware:
+    ├─ Multi-core CPU (adjustable workers)
+    ├─ Real-time CPU/RAM monitor
+    └─ Safe / Balanced / Maximum presets
 
-    ⚠️  SECURITY:
-    Always run OFFLINE. Never enter your seed
-    on websites or share with anyone.
+    ⚠️  Always run OFFLINE. Never share your seed.
 
     ─────────────────────────────────────────────────
     github.com/leonardoramcke/bitcoin-recovery
     MIT License © 2026 leonardoramcke
-        """
-        tk.Label(tab, text=about, bg='#0d1117', fg='#8b949e',
-                 font=('Consolas', 10), justify='left').pack(anchor='w', padx=20, pady=10)
+        """, bg='#0d1117', fg='#8b949e', font=('Consolas',10),
+                 justify='left').pack(anchor='w', padx=20, pady=10)
 
-    def _on_mode_change(self):
-        if self.mode_var.get() == "2_missing_known":
-            self.pos2_spin.config(state='normal')
-        else:
-            self.pos2_spin.config(state='disabled')
-
+    # ── Logging / progress ──────────────────────
     def _log(self, msg):
         self.log_box.config(state='normal')
-        ts = time.strftime('%H:%M:%S')
-        self.log_box.insert('end', f"[{ts}] {msg}\n")
+        self.log_box.insert('end', f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         self.log_box.see('end')
         self.log_box.config(state='disabled')
         self.root.update_idletasks()
 
-    def _set_progress(self, done, total):
-        pct = min(100, (done / total) * 100)
-        self.progress_var.set(pct)
-        self.progress_label.config(text=f"{pct:.1f}%")
+    def _set_prog(self, done, total):
+        p = min(100, done/total*100) if total else 0
+        self.prog_var.set(p)
+        self.prog_lbl.config(text=f"{p:.1f}%")
         self.root.update_idletasks()
 
-    def _export_log(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt", filetypes=[("Text files", "*.txt")],
-            title="Save log")
+    def _export(self):
+        path = filedialog.asksaveasfilename(defaultextension=".txt",
+               filetypes=[("Text","*.txt")], title="Save log")
         if path:
-            content = self.log_box.get('1.0', 'end')
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            messagebox.showinfo("Exported", f"Log saved to:\n{path}")
+            with open(path,'w',encoding='utf-8') as f:
+                f.write(self.log_box.get('1.0','end'))
+            messagebox.showinfo("Saved", f"Log saved to:\n{path}")
 
-    def _validate_inputs(self):
-        raw      = self.words_entry.get('1.0', 'end').strip()
-        words    = raw.split()
-        addr     = self.addr_entry.get().strip()
-        passphrase = self.pass_entry.get()
-        mode     = self.mode_var.get()
-        path     = self.path_var.get().split()[0]
+    # ── Start / Stop ─────────────────────────────
+    def _stop(self):
+        self.stop_event.set()
+        self._log("⛔ Stopped by user.")
 
-        if not words:
-            messagebox.showerror("Error", "Enter the seed words.")
-            return None
-        if not addr:
-            messagebox.showerror("Error", "Enter the target Bitcoin address.")
-            return None
+    def _start(self):
+        # Collect words from grid
+        words_raw = [e.get().strip().lower() for e in self.word_entries]
+        seed_size = self.seed_size_var.get()
+        words_raw = words_raw[:seed_size]
 
-        invalid = [w for w in words if w != '?' and w not in WORDLIST]
+        # Separate known from missing
+        known_words      = []
+        missing_positions = []
+        for i, w in enumerate(words_raw):
+            if w == '' or w is None:
+                missing_positions.append(i)
+            else:
+                known_words.append(w)
+
+        if not missing_positions:
+            messagebox.showerror("Error",
+                "No blank words found.\nLeave blank the words you don't remember.")
+            return
+
+        # Validate known words
+        invalid = [w for w in known_words if w not in WORDLIST]
         if invalid:
             messagebox.showerror("Error",
-                f"Words not found in BIP39 wordlist:\n{', '.join(invalid)}\n\nCheck spelling.")
-            return None
-
-        seed_size = len(words) + words.count('?') if '?' not in words else len(words)
-        return {
-            'words':        words,
-            'passphrase':   passphrase,
-            'address':      addr,
-            'path':         path,
-            'mode':         mode,
-            'addr_limit':   self.addr_limit_var.get(),
-            'change_limit': 2 if self.change_var.get() else 1,
-            'pos1':         self.pos1_var.get(),
-            'pos2':         self.pos2_var.get(),
-            'num_workers':  self.workers_var.get(),
-            'seed_size':    len(words) + 1,
-        }
-
-    def _start_recovery(self):
-        params = self._validate_inputs()
-        if not params:
+                f"These words are not in the BIP39 wordlist:\n{', '.join(invalid)}\n\nCheck spelling.")
             return
+
+        addr = self.addr_entry.get().strip()
+        if not addr:
+            messagebox.showerror("Error", "Enter the Bitcoin address.")
+            return
+
+        passphrase   = self.pass_entry.get()
+        path         = self.path_var.get().split()[0]
+        addr_limit   = self.addr_lim.get()
+        change_limit = 2 if self.change_var.get() else 1
+        workers      = self.workers_var.get()
+        hint_starts  = self.hint_starts.get()
+        hint_length  = self.hint_length_var.get()
+        hint_typo    = self.hint_typo.get()
+
+        # Override positions if user specified
+        if self.pos_mode_var.get() == 'known':
+            raw_pos = self.pos_entry.get().strip()
+            try:
+                missing_positions = [int(x)-1 for x in raw_pos.split()]
+                if any(p < 0 or p >= seed_size for p in missing_positions):
+                    raise ValueError
+            except Exception:
+                messagebox.showerror("Error",
+                    f"Invalid positions. Enter numbers 1–{seed_size} separated by space.")
+                return
+
+        n_missing = len(missing_positions)
+        combos    = 2048 ** n_missing
+        if combos > 10_000_000:
+            _, _, secs = feasibility(combos, workers)
+            if not messagebox.askyesno("⚠️ Warning",
+                f"{n_missing} missing words → {combos:,} combinations\n"
+                f"Estimated time: {fmt_time(secs)}\n\n"
+                f"Start anyway?"):
+                return
+
         self.stop_event.clear()
         self.log_box.config(state='normal')
-        self.log_box.delete('1.0', 'end')
+        self.log_box.delete('1.0','end')
         self.log_box.config(state='disabled')
-        self.progress_var.set(0)
-        self.progress_label.config(text="0%")
-        self.recovery_thread = threading.Thread(
-            target=self._run_recovery, args=(params,), daemon=True)
-        self.recovery_thread.start()
+        self.prog_var.set(0)
+        self.prog_lbl.config(text="0%")
 
-    def _stop_recovery(self):
-        self.stop_event.set()
-        self._log("⛔ Recovery stopped by user.")
+        params = dict(known_words=known_words, missing_positions=missing_positions,
+                      passphrase=passphrase, target=addr, path=path,
+                      addr_limit=addr_limit, change_limit=change_limit,
+                      hint_starts=hint_starts, hint_length=hint_length,
+                      hint_typo=hint_typo, seed_size=seed_size, workers=workers)
 
-    def _run_recovery(self, p):
-        mode        = p['mode']
-        words       = p['words']
-        passphrase  = p['passphrase']
-        target      = p['address']
-        path        = p['path']
-        addr_limit  = p['addr_limit']
-        change_limit= p['change_limit']
-        workers     = p['num_workers']
+        threading.Thread(target=self._run, args=(params,), daemon=True).start()
 
-        self._log(f"▶ Mode: {mode}")
-        self._log(f"  Target address : {target}")
-        self._log(f"  Derivation     : {path}")
-        self._log(f"  Passphrase     : {'(empty)' if not passphrase else '***'}")
-        self._log(f"  Indexes        : {addr_limit} addresses × {change_limit} change")
-        self._log(f"  CPU Workers    : {workers} of {CPU_COUNT} cores")
-        self._log("─" * 50)
+    def _run(self, p):
+        self._log(f"▶ Starting recovery")
+        self._log(f"  Target address  : {p['target']}")
+        self._log(f"  Derivation      : {p['path']}")
+        self._log(f"  Passphrase      : {'(empty)' if not p['passphrase'] else '***'}")
+        self._log(f"  Missing words   : {len(p['missing_positions'])} at positions {[x+1 for x in p['missing_positions']]}")
+        self._log(f"  CPU Workers     : {p['workers']} of {CPU_COUNT} cores")
+        if p['hint_typo']:
+            similar = similar_words(p['hint_typo'], max_dist=2)
+            self._log(f"  Typo search     : '{p['hint_typo']}' → {len(similar)} similar words found")
+        if p['hint_starts']:
+            self._log(f"  Pattern filter  : starts with '{p['hint_starts']}'")
+        if p['hint_length'] > 0:
+            self._log(f"  Length filter   : {p['hint_length']} letters")
 
         start  = time.time()
-        result = None
-
-        try:
-            total_expected = p.get('seed_size', 24)
-            missing = total_expected - len(words)
-
-            # Warn user if many words are missing
-            if missing > 3:
-                combinacoes = 2048 ** missing
-                from math import log10
-                exp = int(log10(combinacoes))
-                ans = messagebox.askyesno("⚠️ Warning — Long Search",
-                    f"You have {len(words)} of {total_expected} words.\n"
-                    f"Missing: {missing} words\n"
-                    f"Combinations: ~10^{exp}\n\n"
-                    f"Estimated time: {formatar_tempo(combinacoes / (SPEED_PER_SECOND * max(1,workers)))}\n\n"
-                    f"The search may take an extremely long time.\n"
-                    f"Do you want to start anyway?")
-                if not ans:
-                    return
-
-            if mode == "1_missing_unknown":
-                result = mode_one_missing(words, passphrase, target, path,
-                                          addr_limit, change_limit, -1,
-                                          self._log, self._set_progress,
-                                          self.stop_event, workers)
-
-            elif mode == "1_missing_known":
-                pos = p['pos1']
-                if pos < 1 or pos > total_expected:
-                    self._log(f"❌ Position must be between 1 and {total_expected}")
-                    return
-                result = mode_one_missing(words, passphrase, target, path,
-                                          addr_limit, change_limit, pos,
-                                          self._log, self._set_progress,
-                                          self.stop_event, workers)
-
-            elif mode == "2_missing_known":
-                pos1, pos2 = p['pos1'], p['pos2']
-                if pos1 < 1 or pos2 < 1 or pos1 >= pos2:
-                    self._log("❌ Provide valid positions (pos1 < pos2)")
-                    return
-                result = mode_two_missing(words, [pos1, pos2], passphrase, target, path,
-                                          addr_limit, change_limit,
-                                          self._log, self._set_progress,
-                                          self.stop_event, workers)
-
-            elif mode == "partial":
-                known_mask = [w != '?' for w in words]
-                n_unknown  = known_mask.count(False)
-                if n_unknown == 0:
-                    self._log("❌ No '?' found in the words.")
-                    return
-                if n_unknown > 3:
-                    ans = messagebox.askyesno("Warning",
-                        f"{n_unknown} unknown words = {2048**n_unknown:,} combinations.\nThis may take a very long time. Continue?")
-                    if not ans:
-                        return
-                result = mode_partial_known(words, known_mask, passphrase, target, path,
-                                            addr_limit, change_limit,
-                                            self._log, self._set_progress,
-                                            self.stop_event, workers)
-
-        except Exception as e:
-            self._log(f"❌ Unexpected error: {e}")
-            return
+        result = recover(
+            known_words       = p['known_words'],
+            missing_positions = p['missing_positions'],
+            passphrase        = p['passphrase'],
+            target            = p['target'],
+            path              = p['path'],
+            addr_limit        = p['addr_limit'],
+            change_limit      = p['change_limit'],
+            hint_starts       = p['hint_starts'],
+            hint_length       = p['hint_length'],
+            hint_typo         = p['hint_typo'],
+            seed_size         = p['seed_size'],
+            log_fn            = self._log,
+            progress_fn       = self._set_prog,
+            stop_event        = self.stop_event,
+            num_workers       = p['workers'])
 
         elapsed = time.time() - start
-        self._set_progress(100, 100)
+        self._set_prog(100, 100)
 
         if result:
-            self._log("═" * 50)
+            self._log("═"*50)
             self._log("✅  WALLET FOUND!")
-            self._log("═" * 50)
-            self._log(f"  Full seed: {' '.join(result['words'])}")
-            if 'found_word' in result:
-                self._log(f"  Found word: '{result['found_word']}' at position {result['position']}")
-            elif 'found_words' in result:
-                self._log(f"  Found words: {result['found_words']}")
-            self._log(f"  Total time: {elapsed:.1f}s")
-            self._log("═" * 50)
-            self._log("⚠️  WRITE DOWN THE 24 WORDS ON PAPER NOW!")
+            self._log("═"*50)
+            self._log(f"  Complete seed : {' '.join(result['words'])}")
+            self._log(f"  Found word(s) : {result['found']} at position(s) {result['positions']}")
+            self._log(f"  Total time    : {elapsed:.1f}s")
+            self._log("═"*50)
+            self._log("⚠️  WRITE DOWN ALL WORDS ON PAPER NOW!")
             messagebox.showinfo("✅ Found!",
                 f"Wallet found!\n\nSeed:\n{' '.join(result['words'])}\n\nWrite it down on paper now!")
         else:
             if not self.stop_event.is_set():
-                self._log("═" * 50)
+                self._log("═"*50)
                 self._log("❌  Not found.")
                 self._log("  Check: passphrase, address, word order, indexes.")
                 self._log(f"  Time: {elapsed:.1f}s")
-                self._log("═" * 50)
+                self._log("═"*50)
 
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
     root = tk.Tk()
-    app  = BitcoinRecoveryApp(root)
+    App(root)
     root.mainloop()
