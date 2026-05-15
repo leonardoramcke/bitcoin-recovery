@@ -981,10 +981,310 @@ class App:
 
 
 # ══════════════════════════════════════════════════════════════
+#  INTRO SCREEN — Circuit Board (Conceito B)
+# ══════════════════════════════════════════════════════════════
+import random, math as _math
+
+class IntroScreen:
+    """
+    Full-screen animated intro: circuit board + travelling particles.
+    Calls launch_callback() when the user clicks INICIAR or after timeout.
+    """
+    W, H = 900, 560
+
+    # Circuit node positions (x, y) — defines the PCB grid
+    _NODES = [
+        (80,80),(220,80),(380,80),(540,80),(700,80),(820,80),
+        (80,180),(180,180),(340,180),(500,180),(660,180),(820,180),
+        (80,280),(240,280),(420,280),(580,280),(740,280),(820,280),
+        (80,380),(200,380),(360,380),(520,380),(680,380),(820,380),
+        (80,460),(220,460),(400,460),(560,460),(720,460),(820,460),
+    ]
+    # Connections between node indices
+    _EDGES = [
+        (0,1),(1,2),(2,3),(3,4),(4,5),
+        (6,7),(7,8),(8,9),(9,10),(10,11),
+        (12,13),(13,14),(14,15),(15,16),(16,17),
+        (18,19),(19,20),(20,21),(21,22),(22,23),
+        (24,25),(25,26),(26,27),(27,28),(28,29),
+        (0,6),(6,12),(12,18),(18,24),
+        (1,7),(7,13),(13,19),(19,25),
+        (2,8),(8,14),(14,20),(20,26),
+        (3,9),(9,15),(15,21),(21,27),
+        (4,10),(10,16),(16,22),(22,28),
+        (5,11),(11,17),(17,23),(23,29),
+    ]
+
+    def __init__(self, root, launch_callback):
+        self.root     = root
+        self.callback = launch_callback
+        self._running = True
+        self._phase   = 'boot'      # boot → draw → particles → ready
+        self._tick    = 0
+        self._drawn   = 0           # edges revealed so far
+        self._particles = []
+        self._btn_alpha = 0         # 0-255 fade-in for button
+        self._logo_alpha = 0
+
+        root.title("BIP39 Wallet Recovery  v2.0")
+        root.geometry(f"{self.W}x{self.H}")
+        root.resizable(False, False)
+        root.configure(bg='#010c18')
+        root.overrideredirect(False)
+
+        # Center on screen
+        root.update_idletasks()
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        root.geometry(f"{self.W}x{self.H}+{(sw-self.W)//2}+{(sh-self.H)//2}")
+
+        self.canvas = tk.Canvas(root, width=self.W, height=self.H,
+                                bg='#010c18', highlightthickness=0)
+        self.canvas.pack(fill='both', expand=True)
+
+        self._build_static()
+        self._animate()
+
+    # ── Static base elements ─────────────────────────────────────
+    def _build_static(self):
+        c = self.canvas
+        # Faint grid dots (PCB substrate)
+        for x in range(0, self.W, 40):
+            for y in range(0, self.H, 40):
+                c.create_oval(x-1, y-1, x+1, y+1,
+                              fill='#0a1f35', outline='')
+
+        # Pre-draw all edges in very dark color (will be "lit" later)
+        self._edge_ids = []
+        for a, b in self._EDGES:
+            ax, ay = self._NODES[a]
+            bx, by = self._NODES[b]
+            eid = c.create_line(ax, ay, bx, by,
+                                fill='#051525', width=1)
+            self._edge_ids.append(eid)
+
+        # Node circles (will be lit progressively)
+        self._node_ids = []
+        for x, y in self._NODES:
+            nid = c.create_oval(x-4, y-4, x+4, y+4,
+                                fill='#051525', outline='#051525', width=1)
+            self._node_ids.append(nid)
+
+        # Central logo area — drawn last so it's on top
+        # Outer ring (pulsing handled in animate)
+        self._ring1 = c.create_oval(390, 210, 510, 330,
+                                    outline='#1f6feb', width=2)
+        self._ring2 = c.create_oval(378, 198, 522, 342,
+                                    outline='#0d3a7a', width=1)
+        self._ring3 = c.create_oval(366, 186, 534, 354,
+                                    outline='#061d3d', width=1)
+
+        # BTC symbol
+        self._logo_btc = c.create_text(450, 270,
+                                       text='₿', fill='#0a2a5e',
+                                       font=('Consolas', 42, 'bold'))
+        # Title text (hidden initially)
+        self._logo_title = c.create_text(450, 390,
+                                         text='B I P 3 9   W A L L E T   R E C O V E R Y',
+                                         fill='#051525',
+                                         font=('Consolas', 11, 'bold'))
+        self._logo_sub = c.create_text(450, 412,
+                                       text='v2.0  ·  Multiprocessing  ·  100% Offline',
+                                       fill='#051525',
+                                       font=('Consolas', 9))
+        self._logo_author = c.create_text(450, 500,
+                                          text='by leonardoramcke',
+                                          fill='#051525',
+                                          font=('Consolas', 9))
+
+        # INICIAR button (hidden initially)
+        self._btn_rect = c.create_rectangle(350, 430, 550, 468,
+                                            fill='#010c18', outline='#051525',
+                                            width=1)
+        self._btn_text = c.create_text(450, 449,
+                                       text='▶   INICIAR',
+                                       fill='#051525',
+                                       font=('Consolas', 12, 'bold'))
+        # Bind click
+        for item in (self._btn_rect, self._btn_text):
+            c.tag_bind(item, '<Button-1>', self._on_start)
+            c.tag_bind(item, '<Enter>',    self._btn_hover_on)
+            c.tag_bind(item, '<Leave>',    self._btn_hover_off)
+
+    # ── Colour helpers ───────────────────────────────────────────
+    @staticmethod
+    def _lerp_color(c1, c2, t):
+        """Linear interpolate between two hex colours."""
+        r1,g1,b1 = int(c1[1:3],16), int(c1[3:5],16), int(c1[5:7],16)
+        r2,g2,b2 = int(c2[1:3],16), int(c2[3:5],16), int(c2[5:7],16)
+        r = int(r1 + (r2-r1)*t)
+        g = int(g1 + (g2-g1)*t)
+        b = int(b1 + (b2-b1)*t)
+        return f'#{r:02x}{g:02x}{b:02x}'
+
+    # ── Main animation loop ──────────────────────────────────────
+    def _animate(self):
+        if not self._running:
+            return
+        self._tick += 1
+        c  = self.canvas
+        t  = self._tick
+
+        # ── Phase: boot (0-20 ticks: flicker nodes on) ──────────
+        if self._phase == 'boot':
+            if t % 3 == 0 and self._drawn < len(self._NODES):
+                idx = self._drawn
+                x, y = self._NODES[idx]
+                c.itemconfig(self._node_ids[idx],
+                             fill='#1f6feb', outline='#58a6ff')
+                self._drawn += 1
+            if self._drawn >= len(self._NODES):
+                self._phase  = 'draw'
+                self._drawn  = 0
+
+        # ── Phase: draw (light up edges one by one) ─────────────
+        elif self._phase == 'draw':
+            per_tick = 2
+            for _ in range(per_tick):
+                if self._drawn < len(self._EDGES):
+                    eid = self._edge_ids[self._drawn]
+                    c.itemconfig(eid, fill='#0d3a6e', width=1)
+                    self._drawn += 1
+            if self._drawn >= len(self._EDGES):
+                self._phase = 'particles'
+                self._spawn_particles(8)
+
+        # ── Phase: particles + logo fade-in ─────────────────────
+        elif self._phase in ('particles', 'ready'):
+            self._update_particles()
+
+            # Logo fade-in
+            if self._logo_alpha < 255:
+                self._logo_alpha = min(255, self._logo_alpha + 6)
+                a = self._logo_alpha / 255
+                btc_col   = self._lerp_color('#0a2a5e', '#58a6ff', a)
+                title_col = self._lerp_color('#051525', '#c9d1d9', a)
+                sub_col   = self._lerp_color('#051525', '#484f58', a)
+                c.itemconfig(self._logo_btc,    fill=btc_col)
+                c.itemconfig(self._logo_title,  fill=title_col)
+                c.itemconfig(self._logo_sub,    fill=sub_col)
+                c.itemconfig(self._logo_author, fill=sub_col)
+
+            # Ring pulse
+            pulse = 0.5 + 0.5 * _math.sin(t * 0.08)
+            ring_col = self._lerp_color('#061d3d', '#1f6feb', pulse)
+            c.itemconfig(self._ring1, outline=ring_col)
+            c.itemconfig(self._ring2,
+                         outline=self._lerp_color('#030e1e', '#0d3a7a', pulse*0.6))
+
+            # Spawn new particles occasionally
+            if t % 18 == 0:
+                self._spawn_particles(2)
+
+            # Button fade-in (after logo is 60% visible)
+            if self._logo_alpha > 150:
+                if self._btn_alpha < 255:
+                    self._btn_alpha = min(255, self._btn_alpha + 5)
+                    a = self._btn_alpha / 255
+                    btn_out  = self._lerp_color('#051525', '#1f6feb', a)
+                    btn_txt  = self._lerp_color('#051525', '#58a6ff', a)
+                    c.itemconfig(self._btn_rect, outline=btn_out)
+                    c.itemconfig(self._btn_text, fill=btn_txt)
+
+                if self._btn_alpha >= 255 and self._phase != 'ready':
+                    self._phase = 'ready'
+
+        self.root.after(30, self._animate)   # ~33 fps
+
+    # ── Particle system ──────────────────────────────────────────
+    def _spawn_particles(self, n):
+        """Spawn n particles on random edges."""
+        for _ in range(n):
+            edge   = random.choice(self._EDGES)
+            a, b   = edge
+            ax, ay = self._NODES[a]
+            bx, by = self._NODES[b]
+            color  = random.choice(['#58a6ff', '#f7b731', '#3fb950', '#79c0ff'])
+            self._particles.append({
+                'ax': ax, 'ay': ay, 'bx': bx, 'by': by,
+                't': 0.0, 'speed': random.uniform(0.015, 0.04),
+                'color': color, 'id': None, 'trail': [],
+            })
+
+    def _update_particles(self):
+        c    = self.canvas
+        dead = []
+        for p in self._particles:
+            # Remove old trail dots
+            for tid in p['trail']:
+                try: c.delete(tid)
+                except: pass
+            p['trail'] = []
+            if p['id']:
+                try: c.delete(p['id'])
+                except: pass
+
+            p['t'] += p['speed']
+            if p['t'] >= 1.0:
+                dead.append(p)
+                continue
+
+            # Current position
+            x = p['ax'] + (p['bx'] - p['ax']) * p['t']
+            y = p['ay'] + (p['by'] - p['ay']) * p['t']
+
+            # Draw trail (3 ghost dots behind)
+            for i, dt in enumerate([0.06, 0.12, 0.18]):
+                tt = max(0, p['t'] - dt)
+                tx = p['ax'] + (p['bx'] - p['ax']) * tt
+                ty = p['ay'] + (p['by'] - p['ay']) * tt
+                alpha = 1 - (i+1)/4
+                r = 2 - i
+                if r > 0:
+                    trail_id = c.create_oval(tx-r, ty-r, tx+r, ty+r,
+                                             fill=p['color'], outline='',
+                                             stipple='gray50' if i>0 else '')
+                    p['trail'].append(trail_id)
+
+            # Draw head
+            pid = c.create_oval(x-4, y-4, x+4, y+4,
+                                fill=p['color'], outline='white', width=0.5)
+            p['id'] = pid
+
+        for p in dead:
+            self._particles.remove(p)
+
+    # ── Button interactions ──────────────────────────────────────
+    def _btn_hover_on(self, _=None):
+        if self._btn_alpha >= 200:
+            self.canvas.itemconfig(self._btn_rect,
+                                   fill='#0d2a4a', outline='#58a6ff', width=2)
+            self.canvas.itemconfig(self._btn_text, fill='#ffffff')
+            self.canvas.configure(cursor='hand2')
+
+    def _btn_hover_off(self, _=None):
+        if self._btn_alpha >= 200:
+            self.canvas.itemconfig(self._btn_rect,
+                                   fill='#010c18', outline='#1f6feb', width=1)
+            self.canvas.itemconfig(self._btn_text, fill='#58a6ff')
+            self.canvas.configure(cursor='')
+
+    def _on_start(self, _=None):
+        self._running = False
+        self.root.destroy()
+        self.callback()
+
+
+# ══════════════════════════════════════════════════════════════
 #  Entry point — freeze_support() required for PyInstaller/Win
 # ══════════════════════════════════════════════════════════════
-if __name__ == '__main__':
-    multiprocessing.freeze_support()
+def _launch_main():
     root = tk.Tk()
     App(root)
     root.mainloop()
+
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
+    intro_root = tk.Tk()
+    IntroScreen(intro_root, _launch_main)
+    intro_root.mainloop()
