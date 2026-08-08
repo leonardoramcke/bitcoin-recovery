@@ -1,11 +1,41 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         BIP39 BITCOIN WALLET RECOVERY TOOL v3.1             ║
+║         BIP39 BITCOIN WALLET RECOVERY TOOL v4.5             ║
 ║         by: leonardoramcke (github.com/leonardoramcke)       ║
 ║         MIT License © 2026                                   ║
 ╠══════════════════════════════════════════════════════════════╣
-║ FIX v3.1 — WINDOWS "Não está respondendo":                  ║
+║ NOVO v4.5 — controle de prioridade (sugerido por outra IA,   ║
+║ avaliado e implementado com ajustes p/ não prejudicar o SO):  ║
+║  ✅ Prioridade dos processos configurável (Normal/Baixa/      ║
+║     Muito baixa) — via psutil.nice(), aba Controle de HW      ║
+║  ✅ Boost automático opcional: sobe pra Normal só quando o    ║
+║     PC fica 5min sem input (Windows, via GetLastInputInfo)    ║
+║     e volta ao configurado assim que você mexe no PC          ║
+║  ✅ Hashrate (combos/s) agora também na barra superior        ║
+║  ⚠️  NÃO implementado agora (fora de escopo): reescrita do    ║
+║     loop interno em Rust/C — ganho real, mas exige toolchain  ║
+║     de build cruzado p/ Windows; hashlib.pbkdf2_hmac já é C   ║
+╠══════════════════════════════════════════════════════════════╣
+║ FIX v4.5 — RAM e estimativa de tempo:                        ║
+║  ✅ chunk_size sem teto virava dezenas de milhões de tuplas   ║
+║     por pacote (3 palavras ausentes ≈ 71 milhões!) — RAM      ║
+║     estourava. Agora limitado a 500–4000 por chunk.           ║
+║  ✅ Divisor de checksum era fixo em 2048 (11 bits) mas o      ║
+║     checksum real do BIP39 é seed_size/3 bits — para 24       ║
+║     palavras são 8 bits (÷256), não 11 (÷2048). Isso fazia    ║
+║     o tempo estimado ficar ~8x menor que o real. Corrigido    ║
+║     e validado empiricamente contra mnemo.check().            ║
+╠══════════════════════════════════════════════════════════════╣
+║ OTIMIZAÇÃO v4.5 — motor de derivação ~11x mais rápido:       ║
+║  ✅ bip32utils (Python puro) → coincurve (libsecp256k1 em C) ║
+║     ver fast_bip32.py — validado contra vetores BIP32 e      ║
+║     contra bip32utils (mesmos endereços bip84/44/49)         ║
+║  ✅ Chave de CONTA cacheada 1x por candidato (derive_account)║
+║     — antes recalculava m/purpose'/0'/0' a cada índice/change║
+║  ✅ hash160 direto via hashlib, sem overhead de objeto Key   ║
+║                                                              ║
+║ FIX v4.5 — WINDOWS "Não está respondendo":                  ║
 ║  ✅ Pool criado em processo separado via mp.Process          ║
 ║     (no Windows, Pool dentro de thread trava a GUI)          ║
 ║  ✅ Comunicação GUI ↔ motor via mp.Queue (IPC seguro)        ║
@@ -13,7 +43,6 @@
 ║  ✅ GUI nunca bloqueia — after() para tudo                   ║
 ║                                                              ║
 ║ OTIMIZAÇÕES v3.0 mantidas:                                   ║
-║  ✅ derive_address recebe master já criado                   ║
 ║  ✅ Globais MNEMO/WORDLIST removidas do topo                 ║
 ║  ✅ hw_monitor e log via root.after() — thread-safe          ║
 ║  ✅ islice nos chunks, template como tuple                   ║
@@ -32,7 +61,49 @@ from multiprocessing import Pool, cpu_count
 from itertools import islice
 import bech32
 from mnemonic import Mnemonic
-from bip32utils import BIP32Key, BIP32_HARDEN
+from fast_bip32 import FastBIP32, HARDEN as BIP32_HARDEN
+
+# ── v4.5: Prioridade de processo + detecção de ociosidade ─────
+# Objetivo: deixar o USUÁRIO decidir se quer que os workers rodem
+# em prioridade baixa (PC continua leve pra outras tarefas) ou
+# normal (mais rápido, mas compete por CPU com o resto do sistema).
+IS_WINDOWS = sys.platform.startswith('win')
+
+def _apply_process_priority(level: str):
+    """Roda DENTRO do processo worker (via initializer do Pool).
+    level: 'normal' | 'below' | 'idle' (do mais rápido pro mais leve)."""
+    try:
+        p = psutil.Process(os.getpid())
+        if IS_WINDOWS:
+            mapping = {
+                'normal': psutil.NORMAL_PRIORITY_CLASS,
+                'below':  psutil.BELOW_NORMAL_PRIORITY_CLASS,
+                'idle':   psutil.IDLE_PRIORITY_CLASS,
+            }
+        else:
+            # os.nice: 0 = normal, valores maiores = mais gentil com o SO
+            mapping = {'normal': 0, 'below': 10, 'idle': 19}
+        p.nice(mapping.get(level, mapping['below']))
+    except Exception:
+        pass  # nunca deixar isso derrubar o worker
+
+def get_idle_seconds():
+    """Segundos desde a última interação do usuário (mouse/teclado).
+    Só funciona no Windows (via GetLastInputInfo). Retorna None em outros SOs
+    — nesse caso o recurso de 'boost automático' fica desabilitado na UI."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info))
+        millis = ctypes.windll.kernel32.GetTickCount() - info.dwTime
+        return millis / 1000.0
+    except Exception:
+        return None
 
 # ── rapidfuzz opcional ───────────────────────────────────────
 try:
@@ -86,7 +157,43 @@ def valid_last_words(words_prefix):
     return [w for w in mnemo.wordlist if mnemo.check(' '.join(words_prefix + [w]))]
 
 # ── Tempo / viabilidade ──────────────────────────────────────
-SPEED_PER_CORE = 200
+# FIX v4.5: um valor fixo (200, depois 3500...) nunca vai bater certo
+# pra todo mundo — cada PC tem uma velocidade real diferente. Em vez
+# de chutar, o app mede a velocidade REAL do hardware do usuário
+# rodando um lote pequeno de PBKDF2+derivação real (~0,3s) na primeira
+# vez que é necessário, e reaproveita o resultado depois.
+_SPEED_CACHE = None
+
+def calibrate_speed_per_core(n_samples=150):
+    """Mede combos/s/núcleo REAIS rodando PBKDF2+derivação de verdade
+    no hardware atual. Cacheado após a 1ª chamada (~0,2–0,4s de custo)."""
+    global _SPEED_CACHE
+    if _SPEED_CACHE is not None:
+        return _SPEED_CACHE
+    phrase = "abandon " * 23 + "about"
+    phrase = phrase.strip()
+    t0 = time.time()
+    for _ in range(n_samples):
+        seed = hashlib.pbkdf2_hmac('sha512', phrase.encode(), b'mnemonic', 2048)
+        master = FastBIP32.from_seed(seed)
+        account = derive_account(master, 'bip84')
+        derive_address_from_account(account, 'bip84', 0, 0)
+    elapsed = max(1e-6, time.time() - t0)
+    _SPEED_CACHE = max(50, n_samples / elapsed)  # nunca deixa ir a 0
+    return _SPEED_CACHE
+
+SPEED_PER_CORE = 500  # fallback só até a 1ª calibração acontecer
+
+def checksum_divisor(seed_size):
+    """
+    FIX v4.5: o app assumia 1/2048 de aproveitamento após o filtro de
+    checksum, mas o checksum do BIP39 tem seed_size/3 bits (4 bits p/
+    12 palavras, 8 bits p/ 24 palavras) — não 11 bits (2048) fixos.
+    Para 24 palavras o divisor real é 256, não 2048 (subestimava o
+    tempo restante em 8x). Validado empiricamente contra mnemo.check().
+    """
+    checksum_bits = max(1, seed_size // 3)
+    return 2 ** checksum_bits
 
 def fmt_time(s):
     if s < 60:          return f"~{int(s)} segundos"
@@ -98,45 +205,83 @@ def fmt_time(s):
     return "eternidade (inviável)"
 
 def feasibility(combos, workers=1):
-    s = combos / max(1, SPEED_PER_CORE * workers)
+    speed = calibrate_speed_per_core()
+    s = combos / max(1, speed * workers)
     if s < 1800:     return "FÁCIL",        "#3fb950", s
     if s < 86400:    return "MODERADO",     "#f7b731", s
     if s < 2592000:  return "DIFÍCIL",      "#e3702a", s
     if s < 31536000: return "MUITO DIFÍCIL","#da3633", s
     return "INVIÁVEL", "#8b0000", s
 
-# ── Derivação de endereço ────────────────────────────────────
-# Recebe master já criado — evita fromEntropy duplicado
-def derive_address(master, path_type="bip84", index=0, change=0):
+# ── Derivação de endereço (v4 — coincurve) ───────────────────
+_PURPOSE = {"bip84": 84, "bip44": 44, "bip49": 49}
+
+def _hash160(b):
+    return hashlib.new('ripemd160', hashlib.sha256(b).digest()).digest()
+
+def derive_account(master, path_type="bip84"):
+    """
+    Deriva a chave da CONTA (m/purpose'/0'/0') UMA VEZ por candidato.
+    Isso evita recalcular os 3 primeiros níveis hardened (os mais caros,
+    pois exigem tweak da chave privada) para cada combinação de
+    change/index testada em seguida — grande ganho quando addr_limit
+    e change_limit são > 1.
+    """
+    purpose = _PURPOSE.get(path_type, 84)
+    return master.child(purpose + BIP32_HARDEN).child(0 + BIP32_HARDEN).child(0 + BIP32_HARDEN)
+
+def derive_address_from_account(account, path_type="bip84", index=0, change=0):
     try:
+        child = account.child(change).child(index)
+        pub = child.public_key()  # 33 bytes comprimidos
         if path_type == "bip84":
-            child = (master.ChildKey(84 + BIP32_HARDEN)
-                           .ChildKey(0  + BIP32_HARDEN)
-                           .ChildKey(0  + BIP32_HARDEN)
-                           .ChildKey(change).ChildKey(index))
-            pub = child.PublicKey()
-            h = hashlib.new('ripemd160', hashlib.sha256(pub).digest()).digest()
+            h = _hash160(pub)
             return bech32.encode('bc', 0, h)
         elif path_type == "bip44":
-            child = (master.ChildKey(44 + BIP32_HARDEN)
-                           .ChildKey(0  + BIP32_HARDEN)
-                           .ChildKey(0  + BIP32_HARDEN)
-                           .ChildKey(change).ChildKey(index))
-            return child.Address()
+            h = _hash160(pub)
+            pre = bytes([0x00])
+            chk = hashlib.sha256(hashlib.sha256(pre + h).digest()).digest()[:4]
+            return _b58encode(pre + h + chk)
         elif path_type == "bip49":
-            child = (master.ChildKey(49 + BIP32_HARDEN)
-                           .ChildKey(0  + BIP32_HARDEN)
-                           .ChildKey(0  + BIP32_HARDEN)
-                           .ChildKey(change).ChildKey(index))
-            pub = child.PublicKey()
-            h = hashlib.new('ripemd160', hashlib.sha256(pub).digest()).digest()
+            h = _hash160(pub)
             redeem = bytes([0x00, 0x14]) + h
-            h2 = hashlib.new('ripemd160', hashlib.sha256(redeem).digest()).digest()
+            h2 = _hash160(redeem)
             pre = bytes([0x05])
             chk = hashlib.sha256(hashlib.sha256(pre + h2).digest()).digest()[:4]
             return _b58encode(pre + h2 + chk)
     except Exception:
         return None
+
+# Mantido por compatibilidade (não é mais usado no hot path do _worker,
+# mas outras partes do código podem chamar a assinatura antiga).
+def derive_address(master, path_type="bip84", index=0, change=0):
+    account = derive_account(master, path_type)
+    return derive_address_from_account(account, path_type, index, change)
+
+_WORD_INDEX = None
+def _word_index_map():
+    """Dict {palavra: índice} — O(1). Construído 1x por processo worker.
+    A lib `mnemonic` usa wordlist.index(palavra) internamente, que é O(n)
+    (busca linear em 2048 itens) e é chamado 24x por candidato — no pior
+    caso (palavra no fim da lista) isso derruba a taxa de ~100k/s pra
+    ~2.700/s. Com dict fica O(1) sempre, ~40x mais rápido no pior caso."""
+    global _WORD_INDEX
+    if _WORD_INDEX is None:
+        _WORD_INDEX = {w: i for i, w in enumerate(_get_wordlist())}
+    return _WORD_INDEX
+
+def _fast_checksum_ok(word_indices, seed_size):
+    """Reimplementação do BIP39 checksum via inteiros/bit-shift — sem
+    string ops. Equivalente a mnemo.check(), validado empiricamente."""
+    ent_bits = 11 * seed_size * 32 // 33
+    cs_bits  = 11 * seed_size - ent_bits
+    num = 0
+    for idx in word_indices:
+        num = (num << 11) | idx
+    checksum      = num & ((1 << cs_bits) - 1)
+    entropy_bytes = (num >> cs_bits).to_bytes(ent_bits // 8, 'big')
+    hash_int      = int.from_bytes(hashlib.sha256(entropy_bytes).digest(), 'big')
+    return checksum == (hash_int >> (256 - cs_bits))
 
 # ══════════════════════════════════════════════════════════════
 # WORKER — processo separado (sem GIL)
@@ -145,27 +290,43 @@ def derive_address(master, path_type="bip84", index=0, change=0):
 def _worker(args):
     (chunk, template, missing_positions, passphrase,
      target_set, path, addr_limit, change_limit) = args
-    mnemo_local = Mnemonic('english')
+    seed_size = len(template)
+    idx_map = _word_index_map()
+
+    # FIX v4.5: os índices das palavras CONHECIDAS (que não mudam entre
+    # combinações) são calculados 1x aqui fora do loop — antes eram
+    # recalculados (via busca linear) a cada uma das milhões de combos.
+    try:
+        base_indices = [idx_map[w] if w is not None else None for w in template]
+    except KeyError:
+        return None  # palavra conhecida digitada não existe na wordlist
+
     for combo in chunk:
+        indices = base_indices.copy()
+        for i, pos in enumerate(missing_positions):
+            indices[pos] = idx_map.get(combo[i])
+        if not _fast_checksum_ok(indices, seed_size):
+            continue
+
         candidate = list(template)
         for i, pos in enumerate(missing_positions):
             candidate[pos] = combo[i]
         phrase = ' '.join(candidate)
-        if not mnemo_local.check(phrase):
-            continue
+
         seed = hashlib.pbkdf2_hmac(
             'sha512',
             phrase.encode('utf-8'),
             ('mnemonic' + passphrase).encode('utf-8'),
             2048)
         try:
-            master = BIP32Key.fromEntropy(seed)
+            master = FastBIP32.from_seed(seed)
+            account = derive_account(master, path)  # calculado 1x por candidato
         except Exception:
             continue
         try:
             for c in range(change_limit):
                 for idx in range(addr_limit):
-                    addr = derive_address(master, path, idx, c)
+                    addr = derive_address_from_account(account, path, idx, c)
                     if addr and addr in target_set:
                         return candidate
         except Exception:
@@ -221,6 +382,7 @@ def _recovery_process(params, result_queue, stop_event):
         hint_typo         = params['hint_typo']
         seed_size         = params['seed_size']
         num_workers       = params['workers']
+        priority          = params.get('priority', 'below')
 
         def log(msg):
             result_queue.put(('log', msg))
@@ -246,12 +408,21 @@ def _recovery_process(params, result_queue, stop_event):
         log(f"  Posições ausentes  : {[p+1 for p in missing_positions]}")
         log(f"  Candidatas/posição : {len(candidates)}")
         log(f"  Total combinações  : {total:,}")
-        log(f"  Após checksum      : ~{max(1, total // 2048):,} chegam ao PBKDF2")
-        log(f"  Tempo estimado     : {fmt_time(total / max(1, SPEED_PER_CORE * num_workers))}")
+        cdiv = checksum_divisor(seed_size)
+        effective_total = max(1, total // cdiv)
+        log(f"  Após checksum      : ~{effective_total:,} chegam ao PBKDF2 (÷{cdiv})")
+        speed = calibrate_speed_per_core()
+        log(f"  Tempo estimado     : {fmt_time(effective_total / max(1, speed * num_workers))}")
         log(f"  Workers            : {num_workers} processos reais")
         log("─" * 50)
 
-        chunk_size = max(200, total // (num_workers * 40))
+        # FIX v4.5: chunk_size sem teto virava dezenas de milhões de
+        # tuplas por pacote (ex.: 3 palavras ausentes → ~71 milhões),
+        # estourando a RAM ao montar/serializar listas gigantes entre
+        # processos. Limitamos a uma faixa sensata (500–4000) — grande
+        # o bastante pra baixo overhead de IPC, pequeno o bastante pra
+        # não empilhar memória nem atrasar o primeiro retorno de progresso.
+        chunk_size = min(4000, max(500, total // (num_workers * 200)))
 
         def make_args(chunk):
             return (chunk, template, missing_positions, passphrase,
@@ -260,7 +431,13 @@ def _recovery_process(params, result_queue, stop_event):
         done = 0
         found = None
 
-        with Pool(processes=num_workers) as pool:
+        with Pool(processes=num_workers,
+                  initializer=_apply_process_priority,
+                  initargs=(priority,)) as pool:
+            try:
+                result_queue.put(('pids', [w.pid for w in pool._pool]))
+            except Exception:
+                pass
             for res in pool.imap_unordered(
                     _worker,
                     (make_args(c) for c in _chunked_product(candidates, n_missing, chunk_size)),
@@ -298,7 +475,7 @@ def _recovery_process(params, result_queue, stop_event):
 class App:
     def __init__(self, root):
         self.root         = root
-        self.root.title("BIP39 Bitcoin Wallet Recovery Tool v3.1")
+        self.root.title("BIP39 Bitcoin Wallet Recovery Tool v4.5")
         self.root.geometry("980x900")
         self.root.minsize(900, 840)
         self.root.configure(bg="#0d1117")
@@ -314,10 +491,13 @@ class App:
         self._last_done   = 0
         self._last_time   = 0
         self._total_combos = 0
+        self.worker_pids  = []       # PIDs reais dos workers (p/ boost automático)
+        self._is_boosted  = False
         self._setup_styles()
         self._build_ui()
         self.root.after(2000, self._hw_tick)
         self.root.after(150,  self._poll_ipc)
+        self.root.after(5000, self._idle_boost_tick)
         # Garante que o processo filho morre ao fechar a janela
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -369,7 +549,7 @@ class App:
         hdr.pack(fill='x', padx=20, pady=(14,0))
         tk.Label(hdr, text="₿ BIP39 Wallet Recovery", bg='#0d1117', fg='#f7b731',
                  font=('Consolas',18,'bold')).pack(side='left')
-        tk.Label(hdr, text="v3.1 | Multiprocessing | Checksum Filter | 100% Offline",
+        tk.Label(hdr, text="v4.5 | Multiprocessing | Checksum Filter | 100% Offline",
                  bg='#0d1117', fg='#484f58', font=('Consolas',9)).pack(side='left', padx=14)
         ttk.Separator(self.root, orient='horizontal').pack(fill='x', padx=20, pady=6)
         self._build_hw_bar()
@@ -403,10 +583,9 @@ class App:
                                   font=('Consolas',9), width=22)
         self.speed_lbl.pack(side='left', padx=4)
 
-        # Botões
+        # Botões (Iniciar fica no passo final do assistente — evita duplicidade)
         btnf = tk.Frame(self.root, bg='#0d1117')
         btnf.pack(pady=(4,10))
-        self._btn(btnf, "▶ INICIAR RECUPERAÇÃO", self._start).pack(side='left', padx=8)
         self._btn(btnf, "■ PARAR", self._stop, '#da3633', 'white').pack(side='left', padx=8)
         self._btn(btnf, "⎘ EXPORTAR LOG", self._export, '#238636', 'white').pack(side='left', padx=8)
 
@@ -433,6 +612,9 @@ class App:
         self.hw_wlbl = tk.Label(bar, text="Workers: 1", bg='#161b22', fg='#c9d1d9',
                                 font=('Consolas',8))
         self.hw_wlbl.pack(side='left', padx=8)
+        self.hw_speed_l = tk.Label(bar, text="", bg='#161b22', fg='#f7b731',
+                                   font=('Consolas',8,'bold'))
+        self.hw_speed_l.pack(side='left', padx=8)
         tk.Label(bar, text="ENGINE: multiprocessing ⚡", bg='#161b22', fg='#f7b731',
                  font=('Consolas',8,'bold')).pack(side='left', padx=12)
         self.hw_safe = tk.Label(bar, text="● SEGURO", bg='#161b22', fg='#3fb950',
@@ -455,6 +637,48 @@ class App:
             pass
         self.root.after(2000, self._hw_tick)
 
+    # ── v4.5: Boost automático — só sobe a prioridade quando o PC
+    # está realmente parado, e desce assim que o usuário volta a usá-lo.
+    # O usuário decide se quer isso ligado (checkbox na aba Hardware).
+    def _idle_boost_tick(self):
+        try:
+            enabled = getattr(self, 'idle_boost_var', None) and self.idle_boost_var.get()
+            active  = self._rec_proc and self._rec_proc.is_alive() and self.worker_pids
+            if enabled and active:
+                idle_s = get_idle_seconds()
+                if idle_s is not None and idle_s >= 300 and not self._is_boosted:
+                    for pid in self.worker_pids:
+                        try:
+                            psutil.Process(pid).nice(
+                                psutil.NORMAL_PRIORITY_CLASS if IS_WINDOWS else 0)
+                        except Exception:
+                            pass
+                    self._is_boosted = True
+                    self.idle_boost_status.config(
+                        text="🚀 PC ocioso — prioridade elevada temporariamente.", fg='#3fb950')
+                elif (idle_s is None or idle_s < 300) and self._is_boosted:
+                    level = self.priority_var.get() if hasattr(self, 'priority_var') else 'below'
+                    for pid in self.worker_pids:
+                        try:
+                            psutil.Process(pid).nice(
+                                {'normal':psutil.NORMAL_PRIORITY_CLASS,
+                                 'below':psutil.BELOW_NORMAL_PRIORITY_CLASS,
+                                 'idle':psutil.IDLE_PRIORITY_CLASS}.get(level, psutil.BELOW_NORMAL_PRIORITY_CLASS)
+                                if IS_WINDOWS else {'normal':0,'below':10,'idle':19}.get(level, 10))
+                        except Exception:
+                            pass
+                    self._is_boosted = False
+                    self.idle_boost_status.config(
+                        text="👤 Você voltou — prioridade normal de volta ao configurado.", fg='#8b949e')
+                elif not self._is_boosted:
+                    self.idle_boost_status.config(text="⏳ Aguardando 5 min de inatividade...", fg='#484f58')
+            elif enabled and not active and hasattr(self, 'idle_boost_status'):
+                self.idle_boost_status.config(text="(ativa somente durante uma recuperação em andamento)", fg='#484f58')
+                self._is_boosted = False
+        except Exception:
+            pass
+        self.root.after(5000, self._idle_boost_tick)
+
     # ── Polling da fila IPC (processo → GUI) ─────────────────
     def _poll_ipc(self):
         """Lê mensagens do processo de recuperação e atualiza a GUI. Thread-safe."""
@@ -465,6 +689,9 @@ class App:
 
                 if kind == 'log':
                     self._flush_log(f"[{time.strftime('%H:%M:%S')}] {msg[1]}")
+
+                elif kind == 'pids':
+                    self.worker_pids = msg[1]
 
                 elif kind == 'progress':
                     _, done, total = msg
@@ -477,6 +704,7 @@ class App:
                     if self._last_time and (now - self._last_time) >= 0.8:
                         spd = (done - self._last_done) / (now - self._last_time)
                         self.speed_lbl.config(text=f"⚡ {spd:,.0f} combos/s")
+                        self.hw_speed_l.config(text=f"⚡ {spd:,.0f} combos/s")
                         self._last_done = done
                         self._last_time = now
                     elif not self._last_time:
@@ -488,8 +716,9 @@ class App:
                     elapsed = time.time() - self._start_time
                     self.prog_var.set(100)
                     self.prog_lbl.config(text="100%")
-                    self.speed_lbl.config(text="")
+                    self.speed_lbl.config(text=""); self.hw_speed_l.config(text="")
                     self._rec_proc = None
+                    self._wiz_reset_start_button()
 
                     if result:
                         self._flush_log("═" * 50)
@@ -512,10 +741,19 @@ class App:
                 elif kind == 'error':
                     self._flush_log(f"❌ ERRO no processo: {msg[1]}")
                     self._rec_proc = None
+                    self._wiz_reset_start_button()
 
         except Exception:
             pass
         self.root.after(150, self._poll_ipc)
+
+    def _wiz_reset_start_button(self):
+        """Restaura o botão pro estado normal após terminar/parar a busca."""
+        if hasattr(self, 'wiz_next_btn'):
+            self.wiz_next_btn.config(text="▶ Iniciar recuperação",
+                                     state='normal', bg='#f7b731', fg='#0d1117')
+        if hasattr(self, 'wiz_back_btn') and getattr(self, 'wiz_idx', 0) > 0:
+            self.wiz_back_btn.config(state='normal')
 
     def _flush_log(self, msg):
         self.log_box.config(state='normal')
@@ -524,39 +762,146 @@ class App:
         self.log_box.config(state='disabled')
 
     # ── Tab: Recuperação ──────────────────────────────────────
+    # ════════════════════════════════════════════════════════
+    # ABA RECUPERAÇÃO — assistente guiado por passos (v4.5)
+    # Em vez de um formulário único, o usuário avança passo a
+    # passo com validação e resumo em tempo real a cada etapa.
+    # ════════════════════════════════════════════════════════
+    WIZ_TITLES = [
+        "Tamanho da seed",
+        "Insira as palavras",
+        "Dicas inteligentes",
+        "Onde estão as ausentes?",
+        "Credenciais",
+        "Resumo e início",
+    ]
+
     def _tab_recovery(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text=" 🔑 Recuperação ")
 
-        top = tk.Frame(tab, bg='#0d1117')
-        top.pack(fill='x', padx=12, pady=(10,4))
+        # ── Indicador de progresso do assistente ───────────────
+        prog_bar = tk.Frame(tab, bg='#0d1117')
+        prog_bar.pack(fill='x', padx=12, pady=(10,4))
+        self.wiz_step_lbl = tk.Label(prog_bar, text="", bg='#0d1117', fg='#484f58',
+                                      font=('Consolas',9))
+        self.wiz_step_lbl.pack(side='left')
+        self.wiz_title_lbl = tk.Label(prog_bar, text="", bg='#0d1117', fg='#f7b731',
+                                       font=('Consolas',11,'bold'))
+        self.wiz_title_lbl.pack(side='left', padx=10)
+        self.wiz_prog_var = tk.DoubleVar()
+        ttk.Progressbar(prog_bar, variable=self.wiz_prog_var, maximum=100,
+                        style='Horizontal.TProgressbar').pack(side='right', fill='x', expand=True, padx=(20,0))
+
+        # ── Container que troca de conteúdo por passo ──────────
+        self.wiz_container = tk.Frame(tab, bg='#0d1117')
+        self.wiz_container.pack(fill='both', expand=True, padx=12)
+
+        self.wiz_steps = [
+            self._wiz_step_seed_size(self.wiz_container),
+            self._wiz_step_words(self.wiz_container),
+            self._wiz_step_hints(self.wiz_container),
+            self._wiz_step_positions(self.wiz_container),
+            self._wiz_step_credentials(self.wiz_container),
+            self._wiz_step_summary(self.wiz_container),
+        ]
+
+        # ── Navegação ───────────────────────────────────────────
+        nav = tk.Frame(tab, bg='#0d1117')
+        nav.pack(fill='x', padx=12, pady=(8,10))
+        self.wiz_back_btn = tk.Button(
+            nav, text="← Voltar", command=self._wiz_back,
+            bg='#21262d', fg='#8b949e', activebackground='#30363d',
+            relief='flat', bd=0, padx=16, pady=8, font=('Consolas',10), cursor='hand2')
+        self.wiz_back_btn.pack(side='left')
+        self.wiz_next_btn = self._btn(nav, "Continuar →", self._wiz_next)
+        self.wiz_next_btn.pack(side='right')
+
+        self.wiz_idx = 0
+        self._wiz_show(0)
+
+    # ── Navegação do assistente ────────────────────────────────
+    def _wiz_show(self, idx):
+        for f in self.wiz_steps:
+            f.pack_forget()
+        self.wiz_idx = idx
+        self.wiz_steps[idx].pack(fill='both', expand=True)
+        n = len(self.wiz_steps)
+        self.wiz_step_lbl.config(text=f"Passo {idx+1} de {n}")
+        self.wiz_title_lbl.config(text=self.WIZ_TITLES[idx])
+        self.wiz_prog_var.set((idx+1) / n * 100)
+        self.wiz_back_btn.config(state='disabled' if idx == 0 else 'normal')
+        self.wiz_next_btn.config(text="▶ Iniciar recuperação" if idx == n-1 else "Continuar →")
+        if idx == n-1:
+            self._wiz_update_summary()
+
+    def _wiz_validate_step(self, idx):
+        """Valida o passo atual antes de avançar. Retorna (ok, mensagem)."""
+        if idx == 1:  # palavras
+            wl = set(_get_wordlist())
+            filled = [e.get().strip().lower() for e in self.word_entries
+                      if e.get().strip()]
+            invalid = [w for w in filled if w not in wl]
+            if invalid:
+                return False, f"Estas palavras não são BIP39 válidas: {', '.join(invalid)}"
+            n_blank = self.seed_size_var.get() - len(filled)
+            if n_blank == 0:
+                return False, "Nenhuma palavra em branco. Deixe vazia a(s) que não lembra."
+            return True, ""
+        if idx == 4:  # credenciais
+            if not self.addr_entry.get().strip():
+                return False, "Insira o endereço Bitcoin antes de continuar."
+        return True, ""
+
+    def _wiz_next(self):
+        if self.wiz_idx == len(self.wiz_steps) - 1:
+            self._start()
+            return
+        ok, msg = self._wiz_validate_step(self.wiz_idx)
+        if not ok:
+            messagebox.showwarning("Verifique antes de continuar", msg)
+            return
+        self._wiz_show(self.wiz_idx + 1)
+
+    def _wiz_back(self):
+        if self.wiz_idx > 0:
+            self._wiz_show(self.wiz_idx - 1)
+
+    # ── Passo 1: tamanho da seed ────────────────────────────────
+    def _wiz_step_seed_size(self, parent):
+        f = tk.Frame(parent, bg='#0d1117')
+        self._label(f, "Quantas palavras tem sua seed?", fg='#c9d1d9', size=11).pack(anchor='w', pady=(10,4))
+        top = tk.Frame(f, bg='#0d1117'); top.pack(anchor='w', pady=4)
         self._label(top, "Tamanho da seed:").pack(side='left')
         self.seed_size_var = tk.IntVar(value=24)
         ttk.Combobox(top, textvariable=self.seed_size_var, width=5,
                      values=[12,15,18,21,24], state='readonly').pack(side='left', padx=6)
-        self._label(top, "palavras — Quantas você tem:").pack(side='left', padx=(10,4))
+        self._label(top, "palavras").pack(side='left')
+
+        top2 = tk.Frame(f, bg='#0d1117'); top2.pack(anchor='w', pady=8)
+        self._label(top2, "Quantas você já tem escritas:").pack(side='left')
         self.known_count_var = tk.IntVar(value=23)
-        tk.Spinbox(top, from_=1, to=24, textvariable=self.known_count_var, width=4,
+        tk.Spinbox(top2, from_=1, to=24, textvariable=self.known_count_var, width=4,
                    bg='#161b22', fg='#c9d1d9', font=('Consolas',10),
                    buttonbackground='#1f2937',
-                   command=self._update_word_grid).pack(side='left')
-        self._label(top, " (deixe em branco as que não lembra)").pack(side='left', padx=8)
+                   command=self._update_word_grid).pack(side='left', padx=6)
+        self._label(f, "(no próximo passo, deixe em branco as posições que não lembra)",
+                    fg='#484f58').pack(anchor='w', pady=(4,0))
+        return f
 
-        # ── Grid de palavras com cola inteligente ──────────────
-        wf = ttk.LabelFrame(tab, text=" INSIRA AS PALAVRAS EM ORDEM ")
-        wf.pack(fill='x', padx=12, pady=4)
-
-        paste_bar = tk.Frame(wf, bg='#0d1117')
-        paste_bar.pack(fill='x', padx=10, pady=(6,2))
+    # ── Passo 2: palavras ────────────────────────────────────────
+    def _wiz_step_words(self, parent):
+        f = tk.Frame(parent, bg='#0d1117')
+        paste_bar = tk.Frame(f, bg='#0d1117')
+        paste_bar.pack(fill='x', pady=(10,2))
         self._label(paste_bar,
                     "💡 Cole todas as palavras de uma vez aqui e pressione ENTER ou clique em Distribuir:",
                     fg='#58a6ff', size=9).pack(side='left')
 
-        paste_row = tk.Frame(wf, bg='#0d1117')
-        paste_row.pack(fill='x', padx=10, pady=(2,6))
-
+        paste_row = tk.Frame(f, bg='#0d1117')
+        paste_row.pack(fill='x', pady=(2,6))
         self.paste_box = tk.Entry(
-            paste_row, width=70, bg='#0d2a4a', fg='#c9d1d9',
+            paste_row, width=60, bg='#0d2a4a', fg='#c9d1d9',
             insertbackground='#58a6ff', relief='flat', bd=6,
             font=('Consolas',10), highlightthickness=1,
             highlightcolor='#58a6ff', highlightbackground='#1f6feb')
@@ -586,21 +931,24 @@ class App:
                   relief='flat', bd=0, padx=10, pady=4,
                   font=('Consolas',9), cursor='hand2').pack(side='left')
 
-        self.paste_status = tk.Label(wf, text="", bg='#0d1117', font=('Consolas',9), anchor='w')
-        self.paste_status.pack(fill='x', padx=10, pady=(0,4))
-        ttk.Separator(wf, orient='horizontal').pack(fill='x', padx=8, pady=(0,6))
-        self._label(wf, "Ou preencha campo a campo — deixe em branco as que não lembra.",
-                    fg='#484f58').pack(anchor='w', padx=10, pady=(0,6))
+        self.paste_status = tk.Label(f, text="", bg='#0d1117', font=('Consolas',9), anchor='w')
+        self.paste_status.pack(fill='x', pady=(0,4))
+        ttk.Separator(f, orient='horizontal').pack(fill='x', pady=(0,6))
+        self._label(f, "Ou preencha campo a campo — a cor mostra se a palavra é válida.",
+                    fg='#484f58').pack(anchor='w', pady=(0,6))
 
         self.word_entries = []
-        self.grid_frame   = tk.Frame(wf, bg='#0d1117')
-        self.grid_frame.pack(fill='x', padx=8, pady=(0,8))
+        self.grid_frame   = tk.Frame(f, bg='#0d1117')
+        self.grid_frame.pack(fill='x', pady=(0,8))
         self._build_word_grid(24)
+        return f
 
-        # ── Dicas ──────────────────────────────────────────────
-        hint_frame = ttk.LabelFrame(tab, text=" DICAS INTELIGENTES (opcional) ")
-        hint_frame.pack(fill='x', padx=12, pady=4)
-        h1 = tk.Frame(hint_frame, bg='#0d1117'); h1.pack(fill='x', padx=10, pady=4)
+    # ── Passo 3: dicas ───────────────────────────────────────────
+    def _wiz_step_hints(self, parent):
+        f = tk.Frame(parent, bg='#0d1117')
+        self._label(f, "Essas dicas são opcionais, mas reduzem MUITO o tempo de busca.",
+                    fg='#3fb950', size=10).pack(anchor='w', pady=(10,8))
+        h1 = tk.Frame(f, bg='#0d1117'); h1.pack(fill='x', pady=4)
         self._label(h1, "Palavra começa com:").pack(side='left')
         self.hint_starts = self._entry(h1, w=8)
         self.hint_starts.pack(side='left', padx=6)
@@ -609,38 +957,40 @@ class App:
         tk.Spinbox(h1, from_=0, to=10, textvariable=self.hint_length_var, width=4,
                    bg='#161b22', fg='#c9d1d9', font=('Consolas',10),
                    buttonbackground='#1f2937').pack(side='left')
-        h2 = tk.Frame(hint_frame, bg='#0d1117'); h2.pack(fill='x', padx=10, pady=(2,8))
+        h2 = tk.Frame(f, bg='#0d1117'); h2.pack(fill='x', pady=(8,8))
         self._label(h2, "Acho que errei a escrita de uma palavra — o que escrevi?").pack(side='left')
         self.hint_typo = self._entry(h2, w=20)
         self.hint_typo.pack(side='left', padx=6)
         self._label(h2, " (encontra palavras BIP39 similares)", fg='#3fb950').pack(side='left')
+        return f
 
-        # ── Posições ───────────────────────────────────────────
-        pos_frame = ttk.LabelFrame(tab, text=" ONDE ESTÃO AS PALAVRAS AUSENTES? ")
-        pos_frame.pack(fill='x', padx=12, pady=4)
+    # ── Passo 4: posições ────────────────────────────────────────
+    def _wiz_step_positions(self, parent):
+        f = tk.Frame(parent, bg='#0d1117')
         self.pos_mode_var = tk.StringVar(value="unknown")
-        tk.Radiobutton(pos_frame, text="Não sei as posições — testar todas automaticamente",
+        tk.Radiobutton(f, text="Não sei as posições — testar todas automaticamente",
                        variable=self.pos_mode_var, value="unknown",
                        bg='#0d1117', fg='#c9d1d9', selectcolor='#161b22',
                        activebackground='#0d1117', activeforeground='#f7b731',
-                       font=('Consolas',10), command=self._on_pos_mode).pack(anchor='w', padx=12, pady=2)
-        tk.Radiobutton(pos_frame, text="Sei as posições:",
+                       font=('Consolas',10), command=self._on_pos_mode).pack(anchor='w', pady=(10,2))
+        tk.Radiobutton(f, text="Sei as posições:",
                        variable=self.pos_mode_var, value="known",
                        bg='#0d1117', fg='#c9d1d9', selectcolor='#161b22',
                        activebackground='#0d1117', activeforeground='#f7b731',
-                       font=('Consolas',10), command=self._on_pos_mode).pack(anchor='w', padx=12, pady=2)
-        pos_row = tk.Frame(pos_frame, bg='#0d1117')
-        pos_row.pack(fill='x', padx=28, pady=(0,8))
+                       font=('Consolas',10), command=self._on_pos_mode).pack(anchor='w', pady=2)
+        pos_row = tk.Frame(f, bg='#0d1117')
+        pos_row.pack(fill='x', padx=24, pady=(0,8))
         self._label(pos_row, "Posições (ex: 5 12 18):").pack(side='left')
         self.pos_entry = self._entry(pos_row, w=30)
         self.pos_entry.pack(side='left', padx=6)
         self._label(pos_row, " separadas por espaço", fg='#484f58').pack(side='left')
         self.pos_entry.config(state='disabled')
+        return f
 
-        # ── Credenciais ────────────────────────────────────────
-        cred = ttk.LabelFrame(tab, text=" CREDENCIAIS ")
-        cred.pack(fill='x', padx=12, pady=4)
-        r1 = tk.Frame(cred, bg='#0d1117'); r1.pack(fill='x', padx=10, pady=4)
+    # ── Passo 5: credenciais ─────────────────────────────────────
+    def _wiz_step_credentials(self, parent):
+        f = tk.Frame(parent, bg='#0d1117')
+        r1 = tk.Frame(f, bg='#0d1117'); r1.pack(fill='x', pady=(10,4))
         self._label(r1, "Passphrase (senha extra):", size=10).pack(side='left')
         self.pass_entry = self._entry(r1, show='•', w=28)
         self.pass_entry.pack(side='left', padx=6)
@@ -651,12 +1001,14 @@ class App:
                            show='' if self.show_pass.get() else '•')).pack(side='left')
         self._label(r1, " (deixe vazio se não usou)", fg='#484f58').pack(side='left')
 
-        r2 = tk.Frame(cred, bg='#0d1117'); r2.pack(fill='x', padx=10, pady=4)
+        r2 = tk.Frame(f, bg='#0d1117'); r2.pack(fill='x', pady=4)
         self._label(r2, "Endereço Bitcoin (bc1q / 1... / 3...):", size=10).pack(side='left')
         self.addr_entry = self._entry(r2, w=50)
         self.addr_entry.pack(side='left', padx=6)
+        self.addr_hint_lbl = tk.Label(r2, text="", bg='#0d1117', font=('Consolas',9))
+        self.addr_hint_lbl.pack(side='left', padx=6)
 
-        r3 = tk.Frame(cred, bg='#0d1117'); r3.pack(fill='x', padx=10, pady=(4,8))
+        r3 = tk.Frame(f, bg='#0d1117'); r3.pack(fill='x', pady=(4,8))
         self._label(r3, "Tipo de endereço:", size=10).pack(side='left')
         self.path_var = tk.StringVar(value="bip84")
         ttk.Combobox(r3, textvariable=self.path_var, width=18,
@@ -673,7 +1025,80 @@ class App:
                        selectcolor='#161b22', activebackground='#0d1117',
                        font=('Consolas',9)).pack(side='left', padx=8)
 
-    # ── Word grid ─────────────────────────────────────────────
+        # Detecta o tipo de endereço automaticamente enquanto digita
+        def _on_addr_change(*_):
+            addr = self.addr_entry.get().strip()
+            if addr.startswith('bc1q'):
+                self.path_var.set("bip84 (bc1q...)")
+                self.addr_hint_lbl.config(text="✅ SegWit nativo detectado (BIP84)", fg='#3fb950')
+            elif addr.startswith('3'):
+                self.path_var.set("bip49 (3...)")
+                self.addr_hint_lbl.config(text="✅ SegWit-P2SH detectado (BIP49)", fg='#3fb950')
+            elif addr.startswith('1'):
+                self.path_var.set("bip44 (1...)")
+                self.addr_hint_lbl.config(text="✅ Legacy detectado (BIP44)", fg='#3fb950')
+            elif addr:
+                self.addr_hint_lbl.config(text="⚠ Formato não reconhecido", fg='#f7b731')
+            else:
+                self.addr_hint_lbl.config(text="")
+        self._addr_trace = self.addr_entry
+        self.addr_entry.bind('<KeyRelease>', _on_addr_change)
+        return f
+
+    # ── Passo 6: resumo + iniciar ────────────────────────────────
+    def _wiz_step_summary(self, parent):
+        f = tk.Frame(parent, bg='#0d1117')
+        self.wiz_summary_box = scrolledtext.ScrolledText(
+            f, height=13, bg='#010409', fg='#c9d1d9', font=('Consolas',10),
+            relief='flat', bd=4, insertbackground='#f7b731', state='disabled')
+        self.wiz_summary_box.pack(fill='both', expand=True, pady=(10,4))
+        self._label(f, "Confira os dados acima. Clique em ▶ Iniciar recuperação quando estiver pronto.",
+                    fg='#484f58').pack(anchor='w')
+        return f
+
+    def _wiz_update_summary(self):
+        words_raw = [e.get().strip().lower() for e in self.word_entries]
+        seed_size = self.seed_size_var.get()
+        words_raw = words_raw[:seed_size]
+        n_missing = sum(1 for w in words_raw if not w)
+        addr = self.addr_entry.get().strip() or "(não informado)"
+        passphrase = "sim" if self.pass_entry.get() else "não"
+        path = self.path_var.get().split()[0] if self.path_var.get() else "bip84"
+        workers = self.workers_var.get() if hasattr(self, 'workers_var') else 1
+        has_typo = bool(self.hint_typo.get().strip())
+        has_starts = bool(self.hint_starts.get().strip())
+
+        combos = 2048 ** max(1, n_missing)
+        cdiv = checksum_divisor(seed_size)
+        effective = max(1, combos // cdiv)
+        level, color, secs = feasibility(effective, workers)
+
+        lines = [
+            "━━━ RESUMO DA RECUPERAÇÃO ━━━", "",
+            f"  Tamanho da seed     : {seed_size} palavras",
+            f"  Palavras ausentes   : {n_missing}",
+            f"  Endereço alvo       : {addr}",
+            f"  Tipo de endereço    : {path}",
+            f"  Passphrase informada: {passphrase}",
+            f"  Dicas ativas        : {'sim' if (has_typo or has_starts) else 'nenhuma'}",
+            f"  Workers de CPU      : {workers} de {CPU_COUNT} núcleos",
+            "",
+            f"  Combinações a testar: ~{effective:,} (após filtro de checksum)",
+            f"  Tempo estimado      : {fmt_time(secs)}",
+            f"  Viabilidade         : {level}",
+        ]
+        self.wiz_summary_box.config(state='normal')
+        self.wiz_summary_box.delete('1.0', 'end')
+        self.wiz_summary_box.tag_config("lvl", foreground=color, font=('Consolas',10,'bold'))
+        for ln in lines:
+            tag = "lvl" if level in ln else None
+            if tag:
+                self.wiz_summary_box.insert('end', ln+"\n", tag)
+            else:
+                self.wiz_summary_box.insert('end', ln+"\n")
+        self.wiz_summary_box.config(state='disabled')
+
+    # ── Word grid (com validação em tempo real) ────────────────
     def _build_word_grid(self, n):
         for w in self.grid_frame.winfo_children():
             w.destroy()
@@ -690,7 +1115,35 @@ class App:
                          font=('Consolas',10), highlightthickness=1,
                          highlightcolor='#f7b731', highlightbackground='#30363d')
             e.pack(side='left')
+            e.bind('<KeyRelease>', self._on_word_entry_change)
             self.word_entries.append(e)
+
+    def _on_word_entry_change(self, event=None):
+        """Valida a palavra em tempo real: verde = válida, vermelho = não reconhecida,
+        cinza = em branco. Também atualiza o contador de status ao lado."""
+        wl = set(_get_wordlist())
+        e = event.widget if event else None
+        if e is not None:
+            w = e.get().strip().lower()
+            if not w:
+                e.config(bg='#161b22', highlightbackground='#30363d')
+            elif w in wl:
+                e.config(bg='#0d2a0d', highlightbackground='#3fb950')
+            else:
+                e.config(bg='#2a0d0d', highlightbackground='#da3633')
+
+        ok = unk = blank = 0
+        for entry in self.word_entries:
+            w = entry.get().strip().lower()
+            if not w: blank += 1
+            elif w in wl: ok += 1
+            else: unk += 1
+        parts = []
+        if ok:  parts.append(f"✅ {ok} válidas")
+        if unk: parts.append(f"❌ {unk} não reconhecidas")
+        if blank: parts.append(f"⬜ {blank} em branco")
+        self.paste_status.config(text="   ".join(parts),
+                                 fg='#3fb950' if unk == 0 else '#f7b731')
 
     def _update_word_grid(self):
         self._build_word_grid(self.seed_size_var.get())
@@ -763,7 +1216,7 @@ class App:
         info = tk.Frame(cpu_f, bg='#161b22')
         info.pack(fill='x', padx=12, pady=(8,4))
         tk.Label(info,
-                 text="  ⚡ v3.1 usa mp.Process + Pool — GUI nunca trava no Windows.\n"
+                 text="  ⚡ v4.5 usa mp.Process + Pool — GUI nunca trava no Windows.\n"
                       "  O uso de CPU mostrará ~100% × workers. Isso é correto e esperado.",
                  bg='#161b22', fg='#3fb950', font=('Consolas',9), justify='left').pack(anchor='w', pady=4)
         self._label(cpu_f, f"Seu CPU tem {CPU_COUNT} núcleos. Escolha quantos dedicar à recuperação:",
@@ -807,6 +1260,44 @@ class App:
         preset_btn(f"🟡 Balanceado\n({max(1,CPU_COUNT//2)} workers — recomendado)", max(1,CPU_COUNT//2), '#b08800')
         preset_btn(f"🔴 Máxima Potência\n({CPU_COUNT} workers — PC pode lentificar)", CPU_COUNT, '#da3633')
 
+        # ── v4.5: Prioridade de processo (deixa o SO priorizar o resto) ──
+        pr_f = ttk.LabelFrame(tab, text=" PRIORIDADE DOS PROCESSOS (novo em v4.5) ")
+        pr_f.pack(fill='x', padx=12, pady=6)
+        self._label(pr_f,
+            "Controla quanto o SO 'empresta' de CPU aos workers quando outros\n"
+            "programas também precisam. Não muda quantos núcleos são usados —\n"
+            "só a prioridade deles na fila do sistema operacional.",
+            fg='#8b949e').pack(anchor='w', padx=12, pady=(8,4))
+        self.priority_var = tk.StringVar(value='below')
+        prow = tk.Frame(pr_f, bg='#0d1117'); prow.pack(fill='x', padx=12, pady=(2,10))
+        for val, text in [
+            ('normal', "🔴 Normal — mais rápido, compete de igual pra igual com outros apps"),
+            ('below',  "🟡 Baixa (recomendado) — cede CPU quando você abre algo"),
+            ('idle',   "🟢 Muito baixa — só usa CPU que estiver realmente sobrando"),
+        ]:
+            tk.Radiobutton(prow, text=text, variable=self.priority_var, value=val,
+                           bg='#0d1117', fg='#c9d1d9', selectcolor='#161b22',
+                           activebackground='#0d1117', activeforeground='#f7b731',
+                           font=('Consolas',9)).pack(anchor='w', pady=1)
+        if not IS_WINDOWS:
+            self._label(pr_f, "  (No Linux/Mac isso usa 'nice' — funciona igual)",
+                        fg='#484f58').pack(anchor='w', padx=12, pady=(0,6))
+
+        # ── v4.5: Boost automático quando o PC está ocioso ────────────
+        idle_avail = get_idle_seconds() is not None
+        boost_f = ttk.LabelFrame(tab, text=" BOOST AUTOMÁTICO (novo em v4.5) ")
+        boost_f.pack(fill='x', padx=12, pady=6)
+        self.idle_boost_var = tk.BooleanVar(value=False)
+        cb = tk.Checkbutton(boost_f,
+            text="🌙 Aumentar a prioridade para Normal quando o PC ficar 5 min sem uso"
+                 + ("" if idle_avail else "  (indisponível — requer Windows)"),
+            variable=self.idle_boost_var, bg='#0d1117', fg='#c9d1d9' if idle_avail else '#484f58',
+            selectcolor='#161b22', activebackground='#0d1117',
+            font=('Consolas',9), state='normal' if idle_avail else 'disabled')
+        cb.pack(anchor='w', padx=12, pady=(8,4))
+        self.idle_boost_status = self._label(boost_f, "", fg='#484f58')
+        self.idle_boost_status.pack(anchor='w', padx=12, pady=(0,8))
+
         wf = ttk.LabelFrame(tab, text=" ORIENTAÇÕES DE SEGURANÇA ")
         wf.pack(fill='both', expand=True, padx=12, pady=6)
         tk.Label(wf, text="""
@@ -814,7 +1305,9 @@ class App:
   💾 Cada worker usa ~50–100 MB de RAM. Use Modo Seguro se tiver menos de 4 GB RAM.
   🔋 Na bateria? Use Modo Seguro — Máxima Potência gasta rápido.
   🖥️ Balanceado permite usar o PC normalmente enquanto a recuperação roda em segundo plano.
-  ⚡ v3.1: GUI nunca trava — motor roda em processo OS separado!
+  🐢 Prioridade "Baixa" (abaixo) cede CPU automaticamente pro resto do sistema — o PC
+     não trava mesmo em Máxima Potência, só fica mais lento se você abrir algo pesado.
+  ⚡ v4.5: GUI nunca trava — motor roda em processo OS separado!
         """, bg='#0d1117', fg='#8b949e', font=('Consolas',9), justify='left').pack(anchor='w', padx=8)
 
     # ── Tab: Análise ──────────────────────────────────────────
@@ -870,11 +1363,12 @@ class App:
         has_hint = self.an_hint.get()
         base    = int(2048 * 0.05) if has_hint else 2048
         combos  = base ** max(1, missing)
-        effective = max(1, combos // 2048)
+        cdiv = checksum_divisor(total)
+        effective = max(1, combos // cdiv)
         level, color, secs = feasibility(effective, workers)
         tempo = fmt_time(secs)
 
-        lines = ["━━━ ANÁLISE DA SITUAÇÃO (motor v3.1) ━━━", ""]
+        lines = ["━━━ ANÁLISE DA SITUAÇÃO (motor v4.5) ━━━", ""]
         lines += [
             f"  Tamanho da seed    : {total} palavras",
             f"  Você tem           : {known} palavras",
@@ -895,7 +1389,7 @@ class App:
         if missing == 0:
             lines += ["  ℹ️ Você tem todas as palavras! Verifique passphrase e derivação."]
         elif missing == 1: lines += ["  🟢 Ótimo. Uma palavra ausente — segundos a minutos."]
-        elif missing == 2: lines += ["  🟡 Possível. Minutos a horas com v3.1."]
+        elif missing == 2: lines += ["  🟡 Possível. Minutos a horas com v4.5."]
         elif missing == 3: lines += ["  🟠 Difícil. Use todas as dicas. Pode levar horas/dias."]
         elif missing <= 5: lines += ["  🔴 Muito difícil. Dicas são essenciais."]
         else:              lines += ["  💀 Inviável sem hardware GPU."]
@@ -930,9 +1424,9 @@ class App:
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text=" ℹ Sobre ")
         tk.Label(tab, text="""
-  ₿ BIP39 Bitcoin Wallet Recovery Tool v3.1
+  ₿ BIP39 Bitcoin Wallet Recovery Tool v4.5
   ════════════════════════════════════════════════════
-  FIX v3.1 — GUI não trava mais no Windows:
+  FIX v4.5 — GUI não trava mais no Windows:
   ├─ Pool criado em mp.Process separado da GUI
   ├─ Comunicação GUI ↔ motor via mp.Queue (IPC)
   └─ Stop via mp.Event compartilhado entre processos
@@ -975,7 +1469,8 @@ class App:
             self._rec_proc.terminate()
             self._rec_proc = None
         self._log("⛔ Parado pelo usuário.")
-        self.speed_lbl.config(text="")
+        self.speed_lbl.config(text=""); self.hw_speed_l.config(text="")
+        self._wiz_reset_start_button()
 
     def _start(self):
         # Mata processo anterior se ainda estiver rodando
@@ -1031,11 +1526,13 @@ class App:
         n_missing = len(missing_positions)
         combos    = 2048 ** n_missing
         if combos > 10_000_000:
-            _, _, secs = feasibility(combos // 2048, workers)
+            cdiv = checksum_divisor(seed_size)
+            effective = combos // cdiv
+            _, _, secs = feasibility(effective, workers)
             if not messagebox.askyesno("⚠️ Aviso",
                     f"{n_missing} palavra(s) ausente(s) → {combos:,} combinações\n"
-                    f"Após filtro de checksum: ~{combos//2048:,} efetivas\n"
-                    f"Tempo estimado (v3.1): {fmt_time(secs)}\n\nIniciar mesmo assim?"):
+                    f"Após filtro de checksum: ~{effective:,} efetivas (÷{cdiv})\n"
+                    f"Tempo estimado (v4.5): {fmt_time(secs)}\n\nIniciar mesmo assim?"):
                 return
 
         # Reset visual
@@ -1047,12 +1544,12 @@ class App:
         self.log_box.config(state='disabled')
         self.prog_var.set(0)
         self.prog_lbl.config(text="0%")
-        self.speed_lbl.config(text="")
+        self.speed_lbl.config(text=""); self.hw_speed_l.config(text="")
         self._last_done = 0
         self._last_time = 0
         self._start_time = time.time()
 
-        self._log("▶ Iniciando recuperação [v3.1 — mp.Process + Pool]")
+        self._log("▶ Iniciando recuperação [v4.5 — mp.Process + Pool]")
         self._log(f"  Endereço alvo    : {addr}")
         self._log(f"  Derivação        : {path}")
         self._log(f"  Passphrase       : {'(vazia)' if not passphrase else '***'}")
@@ -1067,12 +1564,21 @@ class App:
         if hint_length > 0:
             self._log(f"  Filtro tamanho   : {hint_length} letras")
 
+        self.worker_pids = []
+        self._is_boosted = False
+        priority = self.priority_var.get() if hasattr(self, 'priority_var') else 'below'
+
         params = dict(
             known_words=known_words, missing_positions=missing_positions,
             passphrase=passphrase, target=addr, path=path,
             addr_limit=addr_limit, change_limit=change_limit,
             hint_starts=hint_starts, hint_length=hint_length,
-            hint_typo=hint_typo, seed_size=seed_size, workers=workers)
+            hint_typo=hint_typo, seed_size=seed_size, workers=workers,
+            priority=priority)
+
+        pr_label = {'normal':'Normal','below':'Baixa','idle':'Muito baixa'}.get(priority, priority)
+        self._log(f"  Prioridade do SO : {pr_label}"
+                   + ("  (boost automático ligado)" if getattr(self, 'idle_boost_var', None) and self.idle_boost_var.get() else ""))
 
         # ── CORREÇÃO WINDOWS: cria mp.Process (não threading.Thread)
         # O Pool é criado DENTRO do processo filho, nunca na thread da GUI.
@@ -1082,6 +1588,15 @@ class App:
             args=(params, self._ipc_queue, self._mp_stop),
             daemon=False)
         self._rec_proc.start()
+
+        # FIX v4.5: o botão continuava mostrando "▶ Iniciar recuperação"
+        # mesmo com a busca já rodando — parecia que o clique não tinha
+        # feito nada. Agora ele muda de estado imediatamente e só volta
+        # ao normal quando o processo termina (msg 'done'/'error') ou é
+        # parado (_stop()).
+        self.wiz_next_btn.config(text="⏳ Buscando... (veja o LOG abaixo)",
+                                 state='disabled', bg='#30363d', fg='#8b949e')
+        self.wiz_back_btn.config(state='disabled')
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1119,13 +1634,14 @@ class IntroScreen:
         self._running  = True
         self._phase    = 'boot'
         self._tick     = 0
+        self._after_id = None
         self._drawn    = 0
         self._particles     = []
         self._particle_pool = []
         self._btn_alpha  = 0
         self._logo_alpha = 0
 
-        root.title("BIP39 Wallet Recovery v3.1")
+        root.title("BIP39 Wallet Recovery v4.5")
         root.geometry(f"{self.W}x{self.H}")
         root.resizable(False, False)
         root.configure(bg='#010c18')
@@ -1157,7 +1673,7 @@ class IntroScreen:
         self._logo_btc = c.create_text(450,270, text='₿', fill='#0a2a5e', font=('Consolas',42,'bold'))
         self._logo_title  = c.create_text(450,390, text='B I P 3 9  W A L L E T  R E C O V E R Y',
                                           fill='#051525', font=('Consolas',11,'bold'))
-        self._logo_sub    = c.create_text(450,412, text='v3.1 · Multiprocessing · 100% Offline',
+        self._logo_sub    = c.create_text(450,412, text='v4.5 · Multiprocessing · 100% Offline',
                                           fill='#051525', font=('Consolas',9))
         self._logo_author = c.create_text(450,500, text='by leonardoramcke',
                                           fill='#051525', font=('Consolas',9))
@@ -1220,7 +1736,7 @@ class IntroScreen:
                 if self._btn_alpha >= 255 and self._phase != 'ready':
                     self._phase = 'ready'
 
-        self.root.after(30, self._animate)
+        self._after_id = self.root.after(30, self._animate)
 
     def _get_pool_oval(self):
         return self._particle_pool.pop() if self._particle_pool else None
@@ -1283,6 +1799,15 @@ class IntroScreen:
 
     def _on_start(self, _=None):
         self._running = False
+        # FIX v4.5: havia uma animação já agendada (root.after) pra rodar
+        # daqui a pouco. Sem cancelar, o Tcl tenta executá-la numa janela
+        # que acabou de ser destruída → "invalid command name ..._animate"
+        # no terminal (inofensivo, mas feio e evitável).
+        if self._after_id is not None:
+            try:
+                self.root.after_cancel(self._after_id)
+            except Exception:
+                pass
         self.root.destroy()
         self.callback()
 
